@@ -19,6 +19,7 @@
   ],
   "host_permissions": [
     "https://labs.google/*",
+    "https://flow.google.com/*",
     "https://aisandbox-pa.googleapis.com/*",
     "https://aisandbox-pa.sandbox.googleapis.com/*",
     "https://storage.googleapis.com/*",
@@ -34,7 +35,8 @@
     {
       "matches": [
         "https://labs.google/fx/tools/flow*",
-        "https://labs.google/fx/*/tools/flow*"
+        "https://labs.google/fx/*/tools/flow*",
+        "https://flow.google.com/*"
       ],
       "js": [
         "content.js"
@@ -48,7 +50,8 @@
         "injected.js"
       ],
       "matches": [
-        "https://labs.google/*"
+        "https://labs.google/*",
+        "https://flow.google.com/*"
       ]
     }
   ],
