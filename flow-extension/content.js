@@ -51,6 +51,17 @@ window.addEventListener('TRPC_MEDIA_URLS', (e) => {
   }).catch(() => {});
 });
 
+// ─── Token Interception Relay ───────────────────────────────
+window.addEventListener('TOKEN_INTERCEPTED', (e) => {
+  const token = e.detail?.token;
+  if (token) {
+    chrome.runtime.sendMessage({
+      type: 'CAPTURED_PAGE_TOKEN',
+      token,
+    }).catch(() => {});
+  }
+});
+
 // ─── Video Upload Relay ─────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type !== 'UPLOAD_VIDEO') return;

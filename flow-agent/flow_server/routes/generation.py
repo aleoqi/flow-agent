@@ -15,13 +15,14 @@ from fastapi.responses import JSONResponse
 from flow_server.config import OUTPUT_DIR, map_size_to_aspect
 from flow_server.models import (
     ImageGenerationRequest,
+    ImageUpsampleRequest,
     VideoGenerationRequest,
     VideoGenerationResult,
     VideoUpsampleRequest,
 )
 from flow_server.idempotency import get_idempotency_store
 from flow_server.jobs import get_job_store
-from flow_server.history import MediaNotFoundError
+from flow_server.history import MediaNotFoundError, find_history
 from flow_server.media_history import resolve_media_reference
 from flow_server.media_types import ensure_correct_extension, extension_for_media, sniff_media_type
 from flow_server.state import verify_api_key, get_active_bridge, publish, append_to_history
@@ -121,7 +122,7 @@ async def _generate_image(req: ImageGenerationRequest, x_client_id: Optional[str
     target_client_id_var.set(x_client_id)
     active_bridge = await get_active_bridge()
     aspect = map_size_to_aspect(req.size)
-    project_id = os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
+    project_id = req.project_id or os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
 
     ref_media_ids = req.ref_media_ids or None
     temp_img_path = None
@@ -238,34 +239,62 @@ async def _generate_image(req: ImageGenerationRequest, x_client_id: Optional[str
             continue
 
         unique_id = uuid.uuid4().hex[:6]
-        filename = f"flowagent_img_{timestamp}_{unique_id}_{i+1}.png"
-        out_path = os.path.join(OUTPUT_DIR, filename)
+        upscale_tier = str(req.upscale or "2k").strip().lower()
+        if upscale_tier in ("none", "draft", "720p", "native", "off", "no"):
+            upscale_tier = None
 
-        download_success = await download_image(active_bridge, url, out_path)
-        if not download_success:
-            # Generation succeeded but the local download failed (e.g. transient
-            # network/proxy block). Don't lose it — surface the remote URL and
-            # record it in history so it stays recoverable.
-            log.warning("Image %s generated but download failed; returning remote URL", r.get("media_id"))
-            data_outputs.append({
-                "url": url,
-                "media_id": r.get("media_id"),
-                "warning": "generated but local download failed; url is the remote Google Flow link",
-            })
-            await append_to_history(
-                "image",
-                url,
-                req.prompt,
-                r.get("media_id"),
-                None,
-                project_id=project_id,
-            )
-            continue
+        # Google Flow Cloud AI Upsample (2k or 4k)
+        if upscale_tier in ("2k", "4k") and r.get("media_id"):
+            from flow_engine.generators.upsample import upsample_image
+            try:
+                # 4-second pacing for Google reCAPTCHA Enterprise cooldown
+                await asyncio.sleep(4.0)
+                upsample_res = await upsample_image(
+                    active_bridge,
+                    media_id=r["media_id"],
+                    project_id=project_id,
+                    resolution=upscale_tier,
+                )
+                if upsample_res and upsample_res.get("encoded_image"):
+                    img_bytes = base64.b64decode(upsample_res["encoded_image"])
+                    filename = f"flowagent_img_{timestamp}_{unique_id}_{i+1}_{upscale_tier}.jpg"
+                    out_path = os.path.join(OUTPUT_DIR, filename)
+                    with open(out_path, "wb") as f:
+                        f.write(img_bytes)
+                    r["media_id"] = upsample_res.get("media_id") or r["media_id"]
+                    r["_upscaled"] = upscale_tier
+                    log.info("Saved cloud %s image to %s (%.1f KB)", upscale_tier, out_path, len(img_bytes) / 1024)
+            except Exception as e:
+                log.warning("Image cloud upsample to %s failed: %s (falling back to draft)", upscale_tier, e)
 
-        # Flow occasionally serves WebP/JPEG despite a PNG-looking URL.  This
-        # is an auto-generated filename, so make its suffix match its bytes.
-        out_path = ensure_correct_extension(out_path)
-        filename = os.path.basename(out_path)
+        if not r.get("_upscaled"):
+            filename = f"flowagent_img_{timestamp}_{unique_id}_{i+1}.png"
+            out_path = os.path.join(OUTPUT_DIR, filename)
+            download_success = await download_image(active_bridge, url, out_path)
+            if not download_success:
+                # Generation succeeded but the local download failed (e.g. transient
+                # network/proxy block). Don't lose it — surface the remote URL and
+                # record it in history so it stays recoverable.
+                log.warning("Image %s generated but download failed; returning remote URL", r.get("media_id"))
+                data_outputs.append({
+                    "url": url,
+                    "media_id": r.get("media_id"),
+                    "warning": "generated but local download failed; url is the remote Google Flow link",
+                })
+                await append_to_history(
+                    "image",
+                    url,
+                    req.prompt,
+                    r.get("media_id"),
+                    None,
+                    project_id=project_id,
+                )
+                continue
+
+            # Flow occasionally serves WebP/JPEG despite a PNG-looking URL.  This
+            # is an auto-generated filename, so make its suffix match its bytes.
+            out_path = ensure_correct_extension(out_path)
+            filename = os.path.basename(out_path)
 
         if req.response_format == "b64_json":
             with open(out_path, "rb") as image_file:
@@ -289,6 +318,7 @@ async def _generate_image(req: ImageGenerationRequest, x_client_id: Optional[str
                 "url": served_url,
                 "media_id": r.get("media_id"),
                 "client_id": r.get("_client_id", ""),
+                "resolution": r.get("_upscaled") or "draft",
             })
             await append_to_history(
                 "image",
@@ -506,6 +536,92 @@ async def _upsample_and_download(
 
 
 @router.post(
+    "/v1/images/upsample",
+    dependencies=[Depends(verify_api_key)],
+)
+async def openai_upsample_image(
+    req: ImageUpsampleRequest,
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Upsample an existing Flow image to 2K or 4K via Google Flow's official cloud AI upsampler."""
+    target_client_id_var.set(_header_string(x_client_id))
+    active_bridge = await get_active_bridge()
+    project_id = os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
+
+    tier = str(req.resolution or "2k").strip().lower()
+    if tier not in ("2k", "4k"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only '2k' and '4k' resolutions are supported for image upsampling.",
+        )
+
+    # Check history first to resolve project_id and original media_id if present
+    rec = find_history(media_id=req.media_id) or find_history(filename=req.media_id)
+    if rec:
+        if rec.get("project_id"):
+            project_id = rec.get("project_id")
+        source_media_id = rec.get("media_id") or req.media_id
+    else:
+        try:
+            source_media_id = await resolve_media_reference(
+                req.media_id,
+                active_bridge,
+                expected_type="image",
+                project_id=project_id,
+            )
+        except Exception as exc:
+            val = str(req.media_id).strip()
+            if len(val) == 36 and val.count("-") == 4:
+                source_media_id = val
+            else:
+                if isinstance(exc, MediaNotFoundError):
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    from flow_engine.generators.upsample import upsample_image
+    try:
+        res = await upsample_image(active_bridge, source_media_id, project_id, resolution=tier)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    encoded_image = res.get("encoded_image")
+    if not encoded_image:
+        raise HTTPException(status_code=500, detail="Google Flow upsampler did not return image data.")
+
+    timestamp = int(time.time())
+    unique_id = uuid.uuid4().hex[:6]
+    filename = f"flowagent_img_{timestamp}_{unique_id}_{tier}.jpg"
+    out_path = os.path.join(OUTPUT_DIR, filename)
+
+    img_bytes = base64.b64decode(encoded_image)
+    with open(out_path, "wb") as f:
+        f.write(img_bytes)
+
+    served_url, r2_key = await publish(filename, out_path)
+    new_media_id = res.get("media_id") or source_media_id
+
+    await append_to_history(
+        "image",
+        served_url,
+        f"Upsampled to {tier}",
+        new_media_id,
+        r2_key,
+        local_path=out_path,
+        project_id=project_id,
+    )
+
+    return {
+        "created": timestamp,
+        "data": [{
+            "url": served_url,
+            "media_id": new_media_id,
+            "source_media_id": source_media_id,
+            "resolution": tier,
+        }]
+    }
+
+
+@router.post(
     "/v1/videos/upsample",
     dependencies=[Depends(verify_api_key)],
     response_model=VideoGenerationResult,
@@ -654,7 +770,7 @@ async def _generate_video(req: VideoGenerationRequest, x_client_id: Optional[str
     """Generate videos from a prompt (and optional start image)."""
     target_client_id_var.set(x_client_id)
     active_bridge = await get_active_bridge()
-    project_id = os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
+    project_id = req.project_id or os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
 
     # Reject an unusable resolution before anything is paid for.
     upsample_tier = await _resolve_upsample_tier(req.resolution)
@@ -671,15 +787,23 @@ async def _generate_video(req: VideoGenerationRequest, x_client_id: Optional[str
         chosen = active_bridge._select_client_for_cost(cost_each)
         if chosen:
             target_client_id_var.set(chosen)
+            x_client_id = chosen
 
     try:
-        cred_res = await active_bridge.api_request("/v1/credits", body=None, captcha_action=None, method="GET")
+        cred_res = await active_bridge.api_request(
+            "/v1/credits", body=None, captcha_action=None, method="GET", client_id=x_client_id
+        )
         cred_data = cred_res.get("data", cred_res) if isinstance(cred_res, dict) else {}
-        balance = int(cred_data.get("credits", 0))
+        val = cred_data.get("credits")
+        if val is None:
+            val = cred_data.get("total_credits")
+        if val is None and isinstance(cred_data.get("clients"), list):
+            val = sum(c.get("credits", 0) for c in cred_data["clients"] if c.get("ok"))
+        balance = int(val) if val is not None else None
     except Exception:
         balance = None
 
-    if balance is not None:
+    if balance is not None and balance > 0:
         affordable = balance // cost_each
         if affordable < 1:
             raise HTTPException(

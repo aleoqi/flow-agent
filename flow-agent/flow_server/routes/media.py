@@ -10,10 +10,12 @@ import time
 import base64
 import logging
 
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends, Header
 from fastapi.responses import FileResponse
 
 from flow_engine import DEFAULT_PROJECT
+from flow_engine.bridge import target_client_id_var
 
 from flow_server.config import OUTPUT_DIR, public_url
 from flow_server.history import (
@@ -34,6 +36,8 @@ log = logging.getLogger("flow_engine.openai_api")
 router = APIRouter()
 
 
+import asyncio
+
 @router.get("/v1/media/{media_id}/url", dependencies=[Depends(verify_api_key)])
 async def resolve_media_url(media_id: str):
     """Resolve a ready Flow media ID to a fresh signed CDN URL."""
@@ -44,11 +48,96 @@ async def resolve_media_url(media_id: str):
     return {"media_id": media_id, "url": url}
 
 
-@router.post("/v1/upload", dependencies=[Depends(verify_api_key)])
-async def upload_file_endpoint(req: UploadRequest):
-    """Upload a file (image or video) to Google Flow and return its media ID and local URL."""
+@router.post("/v1/test/raw")
+async def test_raw_api(req: dict):
+    """Debug endpoint to test arbitrary Google Flow API calls through the bridge."""
     active_bridge = await get_active_bridge()
-    project_id = os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
+    action = req.get("action", "api_request")
+    if action == "api_request":
+        endpoint = req.get("endpoint", "/v1/flow/upsampleImage")
+        body = req.get("body", {})
+        captcha = req.get("captcha_action")
+        client_id = req.get("client_id")
+        method = req.get("method", "POST")
+        return await active_bridge.api_request(endpoint, body, captcha_action=captcha, method=method, client_id=client_id)
+    elif action == "trpc":
+        client_id = active_bridge._select_client()
+        req_id = str(uuid.uuid4())
+        fut = active_bridge._loop.create_future()
+        active_bridge._pending[req_id] = fut
+        await active_bridge.send_message_to(client_id, {
+            "id": req_id,
+            "method": "trpc_request",
+            "params": req.get("params", {}),
+        })
+        return await asyncio.wait_for(fut, timeout=30)
+    elif action == "get_media_url":
+        client_id = active_bridge._select_client()
+        req_id = str(uuid.uuid4())
+        fut = active_bridge._loop.create_future()
+        active_bridge._pending[req_id] = fut
+        await active_bridge.send_message_to(client_id, {
+            "id": req_id,
+            "method": "get_media_url",
+            "params": req.get("params", {}),
+        })
+        return await asyncio.wait_for(fut, timeout=30)
+    elif action == "solve_captcha":
+        client_id = req.get("client_id") or active_bridge._select_client()
+        req_id = str(uuid.uuid4())
+        fut = active_bridge._loop.create_future()
+        active_bridge._pending[req_id] = fut
+        await active_bridge.send_message_to(client_id, {
+            "id": req_id,
+            "method": "solve_captcha",
+            "params": {"captchaAction": req.get("captcha_action", "VIDEO_GENERATION")},
+        })
+        return await asyncio.wait_for(fut, timeout=35)
+    elif action == "get_status":
+        client_id = req.get("client_id") or active_bridge._select_client()
+        req_id = str(uuid.uuid4())
+        fut = active_bridge._loop.create_future()
+        active_bridge._pending[req_id] = fut
+        await active_bridge.send_message_to(client_id, {
+            "id": req_id,
+            "method": "get_status",
+        })
+        return await asyncio.wait_for(fut, timeout=10)
+    elif action == "reload_extension":
+        targets = list(active_bridge._clients.keys())
+        for cid in targets:
+            await active_bridge.send_message_to(cid, {"method": "reload_extension"})
+        return {"reloaded": targets}
+    elif action == "force_refresh":
+        targets = list(active_bridge._clients.keys())
+        for cid in targets:
+            await active_bridge._force_refresh_client(cid)
+        return {"refreshed": targets}
+    elif action == "send_method":
+        method_name = req.get("method", "refresh_flow_tab")
+        method_params = req.get("params", {})
+        client_id = req.get("client_id")
+        target = client_id or active_bridge._select_client()
+        req_id = str(uuid.uuid4())
+        fut = active_bridge._loop.create_future()
+        active_bridge._pending[req_id] = fut
+        msg = {"id": req_id, "method": method_name, "params": method_params}
+        await active_bridge.send_message_to(target, msg)
+        return await asyncio.wait_for(fut, timeout=10)
+    return {"error": f"Unknown action: {action}"}
+
+
+
+@router.post("/v1/upload", dependencies=[Depends(verify_api_key)])
+async def upload_file_endpoint(
+    req: UploadRequest,
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Upload a file (image or video) to Google Flow and return its media ID and local URL."""
+    cid = str(x_client_id).strip() if isinstance(x_client_id, str) and x_client_id.strip() else None
+    target_client_id_var.set(cid)
+    active_bridge = await get_active_bridge()
+    project_id = req.project_id or os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
 
     b64_data = req.image_base64
     declared_mime = ""
@@ -71,6 +160,25 @@ async def upload_file_endpoint(req: UploadRequest):
             detail=f"Unsupported upload type {mime_type}; provide a valid image or video file.",
         )
 
+    # 1. SHA-256 Content Fingerprint Zero-Duplicate Upload Guard
+    if not req.force_upload:
+        import hashlib
+        content_fingerprint = hashlib.sha256(media_bytes).hexdigest()
+        from flow_server.history import find_history
+        cached_record = find_history(fingerprint=content_fingerprint)
+        if cached_record and cached_record.get("media_id"):
+            cached_media_id = str(cached_record["media_id"]).strip()
+            cached_url = cached_record.get("url") or public_url(cached_record.get("filename", ""))
+            log.info(
+                "Upload cache HIT for sha256=%s... -> reusing media_id=%s",
+                content_fingerprint[:12],
+                cached_media_id,
+            )
+            return {
+                "media_id": cached_media_id,
+                "url": cached_url,
+            }
+
     timestamp = int(time.time())
     extension = extension_for_mime(mime_type)
     temp_name = f"upload_{timestamp}_{uuid.uuid4().hex[:6]}{extension}"
@@ -90,7 +198,7 @@ async def upload_file_endpoint(req: UploadRequest):
                 raise HTTPException(status_code=500, detail="Failed to upload video reference to Google Flow.")
         else:
             from flow_engine.generators.i2v import upload_image
-            media_id = await upload_image(active_bridge, temp_path, project_id)
+            media_id = await upload_image(active_bridge, temp_path, project_id, force_upload=bool(req.force_upload))
             if not media_id:
                 raise HTTPException(status_code=500, detail="Failed to upload image reference to Google Flow.")
 

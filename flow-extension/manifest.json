@@ -12,7 +12,9 @@
     "storage",
     "alarms",
     "tabs",
+    "cookies",
     "webRequest",
+    "webRequestExtraHeaders",
     "scripting",
     "declarativeNetRequest",
     "sidePanel"
@@ -34,6 +36,7 @@
   "content_scripts": [
     {
       "matches": [
+        "https://labs.google/fx*",
         "https://labs.google/fx/tools/flow*",
         "https://labs.google/fx/*/tools/flow*",
         "https://flow.google.com/*"

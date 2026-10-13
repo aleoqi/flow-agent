@@ -55,6 +55,7 @@ class ExtensionBridge:
         self._req_meta: dict[str, dict] = {}
         self._orphan_handler = None
         self._seen_ids: dict[str, bool] = {}
+        self._rr_index = 0
 
         # Client-specific rate limiting
         self._client_sems: dict[str, asyncio.Semaphore] = {}
@@ -373,7 +374,7 @@ class ExtensionBridge:
 
     async def _request_flow_tab_for(self, client_id):
         """Ask specific extension to open or refresh a Flow tab."""
-        if client_id not in self._clients:
+        if client_id not in self._clients and not self.http_registry.is_connected(client_id):
             return
         if self._tokens.get(client_id):
             return
@@ -390,7 +391,7 @@ class ExtensionBridge:
         bypassing the extension's 50-min freshness cache. Used to self-heal a
         stale token (Google invalidates via inactivity before the cache expires).
         """
-        if client_id not in self._clients:
+        if client_id not in self._clients and not self.http_registry.is_connected(client_id):
             return
         try:
             log.info("Force-refreshing Flow tab for client %s (stale token self-heal)...", client_id)
@@ -591,14 +592,16 @@ class ExtensionBridge:
 
     async def api_request(self, url_path, body, captcha_action="VIDEO_GENERATION", method="POST", timeout=None, meta=None, client_id=None):
         """Send API request through a selected Chrome extension."""
+        explicit_target = client_id or target_client_id_var.get() or (meta and meta.get("client_id"))
         if not client_id:
-            client_id = target_client_id_var.get() or self._select_client()
+            client_id = explicit_target or self._select_client()
         if not client_id:
             return {"error": "No extensions connected"}
 
-        log.info("Routing request to client: %s (total connected: %d)", client_id, len(self._clients))
+        log.info("Routing request to client: %s (total connected: %d, explicit_target=%s)", client_id, len(self._clients), bool(explicit_target))
 
         result = await self._run_api_request(client_id, url_path, body, captcha_action, method, timeout, meta)
+        log.info("API request to client %s -> status=%s result=%s", client_id, result.get("status") if isinstance(result, dict) else None, str(result)[:500])
 
         # Self-heal on a stale token or failure:
         if self._is_unauthenticated(result):
@@ -606,32 +609,77 @@ class ExtensionBridge:
             await self._force_refresh_client(client_id)
             result = await self._run_api_request(client_id, url_path, body, captcha_action, method, timeout, meta)
 
-            if self._is_unauthenticated(result):
+            if self._is_unauthenticated(result) and not explicit_target:
                 fallback = self._select_client_excluding(client_id)
                 if fallback:
                     log.warning("Client %s still 401 after refresh — failing over to %s", client_id, fallback)
                     result = await self._run_api_request(fallback, url_path, body, captcha_action, method, timeout, meta)
+        elif self._is_recaptcha_failure(result):
+            # NOTE: 严禁将 403 reCAPTCHA 误判为 Token 失效！Token 仍然有效，施加冷却并无缝 failover
+            log.warning("Client %s encountered reCAPTCHA/rate-limit throttle — cooling down and failing over without clearing token", client_id)
+            if self._loop:
+                self._client_last_request_at[client_id] = self._loop.time() + 3.0
+            if not explicit_target:
+                fallback = self._select_client_excluding(client_id)
+                if fallback:
+                    log.info("Failing over reCAPTCHA request to alternative client: %s", fallback)
+                    retry_res = await self._run_api_request(fallback, url_path, body, captcha_action, method, timeout, meta)
+                    if isinstance(retry_res, dict) and not retry_res.get("error") and retry_res.get("status", 200) < 400:
+                        result = retry_res
         elif isinstance(result, dict) and (result.get("error") or result.get("status") in (400, 500, 503)):
-            fallback = self._select_client_excluding(client_id)
-            if fallback:
-                log.warning("Client %s request failed (%s) — auto failing over to %s", client_id, result.get("error") or result.get("status"), fallback)
-                retry_res = await self._run_api_request(fallback, url_path, body, captcha_action, method, timeout, meta)
-                if isinstance(retry_res, dict) and not retry_res.get("error") and retry_res.get("status", 200) < 400:
-                    result = retry_res
+            if not explicit_target:
+                fallback = self._select_client_excluding(client_id)
+                if fallback:
+                    log.warning("Client %s request failed (%s) — auto failing over to %s", client_id, result.get("error") or result.get("status"), fallback)
+                    retry_res = await self._run_api_request(fallback, url_path, body, captcha_action, method, timeout, meta)
+                    if isinstance(retry_res, dict) and not retry_res.get("error") and retry_res.get("status", 200) < 400:
+                        result = retry_res
         return result
 
     @staticmethod
     def _is_unauthenticated(result) -> bool:
-        """True if an extension response indicates a 401/expired-token error."""
+        """True strictly if an extension response indicates 401/expired-token."""
         if not isinstance(result, dict):
             return False
-        if result.get("status") == 401:
+        status = result.get("status")
+        if status == 401:
+            return True
+        err_msg = str(result.get("error", "")).lower()
+        if "unauthenticated" in err_msg or "invalid authentication credentials" in err_msg:
             return True
         data = result.get("data")
         if isinstance(data, dict):
             err = data.get("error")
-            if isinstance(err, dict) and (err.get("code") == 401 or err.get("status") == "UNAUTHENTICATED"):
-                return True
+            if isinstance(err, dict):
+                code = err.get("code")
+                msg = str(err.get("message", "")).lower()
+                status_str = str(err.get("status", "")).upper()
+                if code == 401 or status_str == "UNAUTHENTICATED":
+                    return True
+                if "invalid authentication credentials" in msg:
+                    return True
+        return False
+
+    @staticmethod
+    def _is_recaptcha_failure(result) -> bool:
+        """True if an extension response indicates 403 or reCAPTCHA evaluation failure."""
+        if not isinstance(result, dict):
+            return False
+        status = result.get("status")
+        err_msg = str(result.get("error", "")).lower()
+        if "recaptcha" in err_msg or "unusual_activity" in err_msg:
+            return True
+        data = result.get("data")
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                msg = str(err.get("message", "")).lower()
+                status_str = str(err.get("status", "")).upper()
+                if "recaptcha" in msg or "unusual_activity" in msg:
+                    return True
+                if code == 403 or status_str == "PERMISSION_DENIED":
+                    return True
         return False
 
     def _select_client_excluding(self, exclude_id) -> str | None:
@@ -640,8 +688,9 @@ class ExtensionBridge:
         candidates = sorted([c for c in active if c != exclude_id and self._tokens.get(c)])
         if not candidates:
             return None
-        selected = candidates[self._rr_index % len(candidates)]
-        self._rr_index = (self._rr_index + 1) % 1000000
+        rr = getattr(self, "_rr_index", 0)
+        selected = candidates[rr % len(candidates)]
+        self._rr_index = (rr + 1) % 1000000
         return selected
 
     async def _run_api_request(self, client_id, url_path, body, captcha_action, method, timeout, meta):

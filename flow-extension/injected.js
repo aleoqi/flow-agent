@@ -14,6 +14,22 @@ const SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
 const _originalFetch = window.fetch;
 window.fetch = async function (...args) {
+  try {
+    const opts = args[1];
+    let authHeader = null;
+    if (opts && opts.headers) {
+      if (typeof opts.headers.get === 'function') {
+        authHeader = opts.headers.get('authorization') || opts.headers.get('Authorization');
+      } else if (typeof opts.headers === 'object') {
+        authHeader = opts.headers['authorization'] || opts.headers['Authorization'];
+      }
+    }
+    if (authHeader && /^bearer\s+ya29\./i.test(authHeader)) {
+      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+      window.dispatchEvent(new CustomEvent('TOKEN_INTERCEPTED', { detail: { token } }));
+    }
+  } catch {}
+
   const response = await _originalFetch.apply(this, args);
   try {
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
@@ -36,10 +52,39 @@ window.fetch = async function (...args) {
 window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   const { requestId, pageAction } = detail;
   try {
-    await waitForGrecaptcha();
-    const token = await window.grecaptcha.enterprise.execute(SITE_KEY, {
-      action: pageAction,
-    });
+    try {
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+      Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+      document.hasFocus = () => true;
+      window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 200 }));
+    } catch (e) {}
+
+    const exec = async (act) => {
+      if (window.grecaptcha?.enterprise?.execute) {
+        return await window.grecaptcha.enterprise.execute(SITE_KEY, act ? { action: act } : undefined);
+      }
+      if (window.grecaptcha?.execute) {
+        return await window.grecaptcha.execute(SITE_KEY, act ? { action: act } : undefined);
+      }
+      throw new Error('grecaptcha execute unavailable');
+    };
+
+    let token = null;
+    try {
+      token = await exec(pageAction);
+    } catch {
+      try {
+        token = await exec('IMAGE_GENERATION');
+      } catch {
+        try {
+          token = await exec(null);
+        } catch (finalErr) {
+          await waitForGrecaptcha();
+          token = await exec(pageAction || 'IMAGE_GENERATION');
+        }
+      }
+    }
+
     window.dispatchEvent(new CustomEvent('CAPTCHA_RESULT', {
       detail: { requestId, token },
     }));

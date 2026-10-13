@@ -207,3 +207,89 @@ async def upsample_video(
         raise ValueError(last_error)
 
     raise ValueError(last_error or "Upsample request was rejected.")
+
+
+IMAGE_UPSAMPLE_RESOLUTIONS = {
+    "2k": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+    "4k": "UPSAMPLE_IMAGE_RESOLUTION_4K",
+}
+
+
+async def upsample_image(
+    bridge,
+    media_id: str,
+    project_id: str,
+    resolution: str = "2k",
+) -> dict:
+    """Upsample an image to 2K or 4K using Google Flow's official cloud AI upsampler.
+
+    Args:
+        bridge: ExtensionBridge instance
+        media_id: Media ID of the original generated image
+        project_id: Flow project ID
+        resolution: Target resolution ('2k' or '4k')
+
+    Returns:
+        dict with keys:
+            - 'media_id': the new upscaled Google Flow media ID
+            - 'encoded_image': base64-encoded bytes of the upscaled image
+            - 'resolution': the target resolution
+            - 'project_id': the project ID that succeeded
+            - 'data': the full raw response data from Google
+    """
+    res_key = str(resolution or "2k").strip().lower()
+    enum_val = IMAGE_UPSAMPLE_RESOLUTIONS.get(res_key, "UPSAMPLE_IMAGE_RESOLUTION_2K")
+    endpoint = ENDPOINTS.get("upsample_image", "/v1/flow/upsampleImage")
+    log.info("Google Flow upsampling image %s -> %s [%s]", media_id[:12], res_key, enum_val)
+
+    # Collect project candidates: passed project_id first, then known fallback projects
+    candidates = [project_id] if project_id else []
+    for alt in ("0143adf4-5864-4cb4-abb5-fe4254ad0dc7", "576adec2-b74d-4cd9-93da-ad81378711db"):
+        if alt and alt not in candidates:
+            candidates.append(alt)
+
+    last_error = ""
+    status = 0
+    for pid in candidates:
+        body = {
+            "mediaId": media_id,
+            "targetResolution": enum_val,
+            "clientContext": build_client_context(pid),
+        }
+
+        for attempt in range(2):
+            result = await bridge.api_request(
+                endpoint, body, captcha_action="IMAGE_GENERATION"
+            )
+
+            status = result.get("status", 0)
+            if status == 200:
+                data = result.get("data", {})
+                media_info = data.get("media", {})
+                new_media_id = media_info.get("name") or media_info.get("mediaId")
+                encoded_image = data.get("encodedImage")
+                log.info("Google Flow upsampled image successfully! %s -> %s (project: %s)", media_id[:12], new_media_id or "direct", pid)
+                return {
+                    "media_id": new_media_id or media_id,
+                    "encoded_image": encoded_image,
+                    "resolution": res_key,
+                    "project_id": pid,
+                    "data": data,
+                }
+
+            last_error = _error_message(result)
+            if status == 403 and "unusual_activity" in last_error.lower() and attempt == 0:
+                log.info("reCAPTCHA rate limit encountered; pausing 2.5s before retry...")
+                import asyncio
+                await asyncio.sleep(2.5)
+                continue
+            break
+
+        if status in (400, 404) and len(candidates) > 1:
+            log.warning("Upsample with project %s returned %s (%s); trying fallback project...", pid, status, last_error)
+            continue
+        break
+
+    log.error("Google Flow image upsample failed (%s): %s", status, last_error)
+    raise ValueError(f"Google Flow image upsample failed ({status}): {last_error}")
+

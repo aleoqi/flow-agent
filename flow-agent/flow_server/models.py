@@ -17,6 +17,15 @@ class ImageGenerationRequest(BaseModel):
     image_base64: Optional[str] = Field(None, description="Optional base64 reference image for image-to-image")
     ref_media_ids: Optional[List[str]] = Field(None, description="Optional reference image media IDs (up to 10)")
     seed: Optional[int] = Field(None, ge=0, le=4294967295, description="Optional explicit generation seed")
+    upscale: Optional[str] = Field("2k", description="Optional delivery resolution: '2k' (default) or '4k' via Google Flow's official cloud AI upsampler. Pass 'none' or 'draft' to skip upsampling.")
+    project_id: Optional[str] = Field(None, description="Optional target Flow project ID override")
+
+
+class ImageUpsampleRequest(BaseModel):
+    """Upsample one already-generated Flow image to 2K or 4K."""
+
+    media_id: str = Field(..., description="Media ID of a generated Flow image, or a local image path/filename in history")
+    resolution: str = Field("2k", description="Target resolution: '2k' or '4k'")
 
 
 class VideoGenerationRequest(BaseModel):
@@ -31,6 +40,7 @@ class VideoGenerationRequest(BaseModel):
     is_video: Optional[bool] = Field(False, description="True if the pre-uploaded reference is a video")
     seed: Optional[int] = Field(None, ge=0, le=4294967295, description="Optional explicit generation seed")
     video_model: Optional[str] = Field(None, description="Optional Flow videoModelKey override")
+    project_id: Optional[str] = Field(None, description="Optional target Flow project ID override")
     resolution: Optional[str] = Field(
         None,
         description=(
@@ -83,3 +93,5 @@ class ChatCompletionRequest(BaseModel):
 
 class UploadRequest(BaseModel):
     image_base64: str = Field(..., description="Base64 encoded image or video data")
+    project_id: Optional[str] = Field(None, description="Optional target Flow project ID override")
+    force_upload: Optional[bool] = Field(False, description="Bypass cache and force direct upload")

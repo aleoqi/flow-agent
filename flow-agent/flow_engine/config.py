@@ -71,7 +71,7 @@ LEGACY_MEDIA_STORE_FILE = os.path.join(OUTPUT_DIR, "media-ids.json")
 
 # ─── Project ─────────────────────────────────────────────────
 
-DEFAULT_PROJECT = os.environ.get("DEFAULT_PROJECT", "0143adf4-5864-4cb4-abb5-fe4254ad0dc7")
+DEFAULT_PROJECT = os.environ.get("DEFAULT_PROJECT", "395d699c-f383-4313-b45d-ecc6f4ab148a")
 
 # Available image models:
 # - harbor_seal (Nano Banana 2 Lite)
@@ -117,6 +117,7 @@ ENDPOINTS = {
     "generate_r2v": "/v1/video:batchAsyncGenerateVideoReferenceImages",
     "generate_edit": "/v1/video:batchAsyncGenerateVideoEditVideo",
     "upload_image": "/v1/flow/uploadImage",
+    "upsample_image": "/v1/flow/upsampleImage",
     "upsample_video": "/v1/video:batchAsyncGenerateVideoUpsampleVideo",
     "poll_status": "/v1/video:batchCheckAsyncVideoGenerationStatus",
     "get_media": "/v1/media/{media_id}",
@@ -181,13 +182,13 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "420"))
 
 # Max seconds to wait for a single extension roundtrip (fail fast to allow auto-retry).
-API_REQUEST_TIMEOUT = int(os.environ.get("API_REQUEST_TIMEOUT", "60"))
+API_REQUEST_TIMEOUT = int(os.environ.get("API_REQUEST_TIMEOUT", "300"))
 
 # ─── Rate limiting (protects against Google's UNUSUAL_ACTIVITY throttle) ──────
-# Optimal concurrent requests in flight per worker (4 parallel slots).
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "4"))
-# Minimum spacing between the start of consecutive generation requests (2.0s stagger).
-REQUEST_MIN_INTERVAL = float(os.environ.get("REQUEST_MIN_INTERVAL", "2.0"))
+# Optimal concurrent requests in flight per worker (2 parallel slots per browser).
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2"))
+# Minimum spacing between the start of consecutive generation requests (2.5s stagger).
+REQUEST_MIN_INTERVAL = float(os.environ.get("REQUEST_MIN_INTERVAL", "2.5"))
 
 SEGMENT_DURATION = 10
 FPS = 24

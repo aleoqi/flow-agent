@@ -125,10 +125,14 @@ def _ensure_backend():
         command = [sys.executable]
         if not getattr(sys, "frozen", False):
             command.append(os.path.abspath(__file__))
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
         )
     except Exception as error:
         _fail(
@@ -327,13 +331,15 @@ def _download_media(url, output_path, *, preserve_explicit=True):
             pass
 
 
-def _post_generation(path, payload, idempotency_key, timeout=300):
-    headers = {"Idempotency-Key": idempotency_key}
+def _post_generation(path, payload, idempotency_key, timeout=300, headers=None):
+    request_headers = {"Idempotency-Key": idempotency_key}
+    if headers:
+        request_headers.update(headers)
     last_error = None
     for attempt in range(2):
         try:
             result, _ = _request_json(
-                path, method="POST", payload=payload, headers=headers, timeout=timeout
+                path, method="POST", payload=payload, headers=request_headers, timeout=timeout
             )
             return result
         except CliError as error:
@@ -490,8 +496,17 @@ def cmd_image(argv):
         default="portrait",
     )
     parser.add_argument("--count", "-c", type=int, choices=[1, 2, 3, 4], default=1)
-    parser.add_argument("--ref", "-r", nargs="+", metavar="IMAGE", help="Reference path or media ID")
+    parser.add_argument("--ref", "-r", nargs="+", action="extend", metavar="IMAGE", help="Reference path or media ID")
     parser.add_argument("--model", "-m", default="narwhal")
+    parser.add_argument(
+        "--upscale",
+        "-u",
+        choices=["2k", "4k", "none"],
+        default="2k",
+        help="Google Flow cloud AI upsample resolution: '2k' (default) or '4k'. Pass 'none' to skip upsampling.",
+    )
+    parser.add_argument("--project-id", "-p", default=None, help="Target Flow project ID")
+    parser.add_argument("--client", default=None, help="Target Flow extension client ID")
     parser.add_argument("--idempotency-key", help="Reuse a previous paid request safely")
     args = parser.parse_args(argv)
 
@@ -511,33 +526,82 @@ def cmd_image(argv):
         "size": sizes[args.aspect],
         "response_format": "url",
     }
+    if args.project_id:
+        payload["project_id"] = args.project_id
+    if args.upscale and args.upscale != "none":
+        payload["upscale"] = args.upscale
 
     media_ids = []
-    local_refs = []
     for ref in args.ref or []:
         if os.path.isfile(ref):
-            local_refs.append(ref)
+            uploaded = _upload_one(ref)
+            media_ids.append(uploaded["media_id"])
         else:
             media_ids.append(ref)
-    if len(local_refs) > 1:
-        parser.error("flow image currently accepts at most one local reference file")
-    if local_refs:
-        payload["image_base64"] = _file_data_uri(local_refs[0])
     if media_ids:
         payload["ref_media_ids"] = media_ids[:10]
 
+    headers = {}
+    if args.client:
+        headers["X-Client-Id"] = args.client
     idempotency_key = args.idempotency_key or uuid.uuid4().hex
     result = _post_generation(
-        "/v1/images/generations", payload, idempotency_key, timeout=300
+        "/v1/images/generations", payload, idempotency_key, timeout=300, headers=headers
     )
     _save_outputs(result, output_path, "image", explicit_output=explicit_output)
 
 
-def _upload_one(path):
+def _get_file_sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _lookup_cached_media_id(fingerprint: str) -> str | None:
+    """Check local history registries for a matching SHA-256 fingerprint."""
+    history_candidates = [
+        os.path.abspath(os.path.expanduser(os.environ.get("FLOW_HISTORY_FILE", ""))),
+        r"C:\Users\Administrator\.local\bin\output\history.json",
+        os.path.join(ROOT_DIR, "output", "history.json"),
+    ]
+    for hp in history_candidates:
+        if hp and os.path.isfile(hp):
+            try:
+                with open(hp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for item in data.get("history", []):
+                    if item.get("fingerprint") == fingerprint and item.get("media_id"):
+                        return str(item["media_id"]).strip()
+            except Exception:
+                pass
+    return None
+
+
+def _upload_one(path, force_upload=False, client=None, project_id=None):
+    if not force_upload and os.path.isfile(path):
+        fp = _get_file_sha256(path)
+        cached_id = _lookup_cached_media_id(fp)
+        if cached_id:
+            return {"media_id": cached_id, "cached": True}
+
+    payload = {"image_base64": _file_data_uri(path)}
+    if project_id:
+        payload["project_id"] = project_id
+    if force_upload:
+        payload["force_upload"] = True
+
+    headers = {}
+    if client:
+        headers["X-Client-Id"] = client
+
     result, _ = _request_json(
         "/v1/upload",
         method="POST",
-        payload={"image_base64": _file_data_uri(path)},
+        payload=payload,
+        headers=headers,
         timeout=300,
     )
     media_id = result.get("media_id") if isinstance(result, dict) else None
@@ -557,7 +621,7 @@ def cmd_video(argv):
     parser.add_argument("--start", "-s", metavar="IMAGE", help="Start image path or media ID")
     parser.add_argument("--end", metavar="IMAGE", help="End image path or media ID (use with --start)")
     parser.add_argument("--ref", "-r", nargs="+", metavar="IMAGE", help="Reference image paths or media IDs")
-    parser.add_argument("--project-id", "-p", help="Deprecated; configure DEFAULT_PROJECT on the backend")
+    parser.add_argument("--project-id", "-p", default=None, help="Target Flow project ID")
     parser.add_argument(
         "--resolution",
         "-R",
@@ -569,6 +633,8 @@ def cmd_video(argv):
             "written to --output."
         ),
     )
+    parser.add_argument("--client", default=None, help="Target Flow extension client ID")
+    parser.add_argument("--force-upload", action="store_true", help="Force direct upload without caching")
     parser.add_argument("--idempotency-key", help="Reuse a previous paid request safely")
     args = parser.parse_args(argv)
 
@@ -586,32 +652,41 @@ def cmd_video(argv):
         "duration": args.duration,
         "n": args.count,
     }
+    if args.project_id:
+        payload["project_id"] = args.project_id
     if args.resolution != "720p":
         payload["resolution"] = args.resolution
     if args.edit:
         payload.update({"start_media_id": args.edit, "is_video": True})
     elif args.start:
         if os.path.isfile(args.start):
-            payload["image_base64"] = _file_data_uri(args.start)
+            start_uploaded = _upload_one(args.start, force_upload=args.force_upload, client=args.client, project_id=args.project_id)
+            payload["start_media_id"] = start_uploaded["media_id"]
         else:
             payload["start_media_id"] = args.start
         if args.end:
             if os.path.isfile(args.end):
-                payload["end_media_id"] = _upload_one(args.end)["media_id"]
+                end_uploaded = _upload_one(args.end, force_upload=args.force_upload, client=args.client, project_id=args.project_id)
+                payload["end_media_id"] = end_uploaded["media_id"]
             else:
                 payload["end_media_id"] = args.end
     elif args.ref:
         reference_ids = []
         for reference in args.ref:
             if os.path.isfile(reference):
-                reference_ids.append(_upload_one(reference)["media_id"])
+                ref_uploaded = _upload_one(reference, force_upload=args.force_upload, client=args.client, project_id=args.project_id)
+                reference_ids.append(ref_uploaded["media_id"])
             else:
                 reference_ids.append(reference)
         payload["ref_media_ids"] = reference_ids[:10]
 
+    headers = {}
+    if args.client:
+        headers["X-Client-Id"] = args.client
+
     idempotency_key = args.idempotency_key or uuid.uuid4().hex
     result = _post_generation(
-        "/v1/videos/generations", payload, idempotency_key, timeout=300
+        "/v1/videos/generations", payload, idempotency_key, timeout=300, headers=headers
     )
     result = _poll_video_job(result, idempotency_key)
     _save_outputs(result, output_path, "video", explicit_output=explicit_output)
@@ -693,40 +768,81 @@ def cmd_upsample(argv):
     parser = argparse.ArgumentParser(
         prog="flow upsample",
         description=(
-            "Upsample a finished Flow video to 1080p or 4k — the high-resolution "
-            "pass behind the Flow UI's HD download."
+            "Upsample a generated Flow image (2k/4k) or video (1080p/4k) "
+            "via Google Flow's official cloud AI upsampler."
         ),
     )
-    parser.add_argument("media_id", help="Flow video media ID, or a local video path tracked in history")
+    parser.add_argument("media_id", help="Flow media ID, or a local file path tracked in history")
     parser.add_argument(
         "--resolution",
         "-R",
-        choices=["1080p", "4k"],
-        default="1080p",
-        help="Target resolution (1080p is free; 4k costs credits and needs a higher tier)",
+        default=None,
+        help="Target resolution ('2k'/'4k' for image, '1080p'/'4k' for video)",
+    )
+    parser.add_argument(
+        "--type",
+        "-t",
+        choices=["image", "video"],
+        default=None,
+        help="Media type: 'image' or 'video' (auto-detected if omitted)",
     )
     parser.add_argument("--aspect", "-a", choices=["portrait", "landscape"], default="landscape")
     parser.add_argument("--output", "-o", default=None, help="Exact output file path")
-    parser.add_argument("--seed", type=int, help="Optional explicit upsampler seed")
+    parser.add_argument("--seed", type=int, help="Optional explicit upsampler seed (video only)")
+    parser.add_argument("--client", default=None, help="Target Flow extension client ID")
     parser.add_argument("--idempotency-key", help="Reuse a previous paid request safely")
     args = parser.parse_args(argv)
 
     _wait_for_generation_ready()
-    output_path, explicit_output = _requested_output_path(
-        args.output, f"video_{args.resolution}.mp4"
-    )
-    payload = {
-        "media_id": args.media_id,
-        "resolution": args.resolution,
-        "aspect": args.aspect,
-    }
-    if args.seed is not None:
-        payload["seed"] = args.seed
 
-    idempotency_key = args.idempotency_key or uuid.uuid4().hex
-    result = _post_generation("/v1/videos/upsample", payload, idempotency_key, timeout=900)
-    result = _poll_video_job(result, idempotency_key)
-    _save_outputs(result, output_path, "video", explicit_output=explicit_output)
+    res = str(args.resolution or "").strip().lower()
+    media_type = args.type
+
+    if not media_type:
+        if res in ("2k",):
+            media_type = "image"
+        elif res in ("1080p", "720p"):
+            media_type = "video"
+        elif os.path.isfile(args.media_id):
+            ext = os.path.splitext(args.media_id)[1].lower()
+            media_type = "image" if ext in (".png", ".jpg", ".jpeg", ".webp") else "video"
+        else:
+            # Default: if 2k requested or ambiguous, check res
+            media_type = "image" if res in ("2k",) else "video"
+
+    headers = {}
+    if args.client:
+        headers["X-Client-Id"] = args.client
+
+    if media_type == "image":
+        target_res = res if res in ("2k", "4k") else "2k"
+        output_path, explicit_output = _requested_output_path(
+            args.output, f"image_{target_res}.jpg"
+        )
+        payload = {
+            "media_id": args.media_id,
+            "resolution": target_res,
+        }
+        idempotency_key = args.idempotency_key or uuid.uuid4().hex
+        result = _post_generation("/v1/images/upsample", payload, idempotency_key, timeout=300, headers=headers)
+        _save_outputs(result, output_path, "image", explicit_output=explicit_output)
+    else:
+        target_res = res if res in ("1080p", "4k") else "1080p"
+        output_path, explicit_output = _requested_output_path(
+            args.output, f"video_{target_res}.mp4"
+        )
+        payload = {
+            "media_id": args.media_id,
+            "resolution": target_res,
+            "aspect": args.aspect,
+        }
+        if args.seed is not None:
+            payload["seed"] = args.seed
+
+        idempotency_key = args.idempotency_key or uuid.uuid4().hex
+        result = _post_generation("/v1/videos/upsample", payload, idempotency_key, timeout=900, headers=headers)
+        result = _poll_video_job(result, idempotency_key)
+        _save_outputs(result, output_path, "video", explicit_output=explicit_output)
 
 
 def cmd_credits(argv):

@@ -19,7 +19,7 @@ IMAGE_ASPECTS = {
     "landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",   # 16:9
     "4x3":       "IMAGE_ASPECT_RATIO_4_3",          # 4:3
     "square":    "IMAGE_ASPECT_RATIO_SQUARE",        # 1:1
-    "3x4":       "IMAGE_ASPECT_RATIO_3_4",           # 3:4
+    "3x4":       "IMAGE_ASPECT_RATIO_PORTRAIT",      # 3:4 maps to vertical portrait in Google Flow
     "portrait":  "IMAGE_ASPECT_RATIO_PORTRAIT",      # 9:16
 }
 
@@ -117,7 +117,7 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
 
     log.info('  Generating: "%s" [%s] x%d', prompt[:50], aspect, count)
     result = await bridge.api_request(
-        endpoint, body, captcha_action="IMAGE_GENERATION",
+        endpoint, body, captcha_action="IMAGE_GENERATION", timeout=300,
         meta={"prompt": prompt, "count": count},
     )
 

@@ -47,16 +47,17 @@ async def upload_image(
     body = {
         "clientContext": {"tool": CLIENT_CTX["tool"], "projectId": project_id},
         "imageBytes": img_data,
+        "mimeType": mime_type,
     }
 
     log.info("Uploading image: %s", os.path.basename(image_path))
-    result = await bridge.api_request(ENDPOINTS["upload_image"], body)
+    result = await bridge.api_request(ENDPOINTS["upload_image"], body, captcha_action=None)
 
     status = result.get("status", 0)
     data = result.get("data", {})
     if status != 200:
         err = data.get("error", {}).get("message", "Unknown") if isinstance(data, dict) else str(data)
-        err_msg = f"Image upload failed: {err}"
+        err_msg = f"Image upload failed: {err} | status={status} | full_result={result}"
         log.error("%s", err_msg)
         raise ValueError(err_msg)
 

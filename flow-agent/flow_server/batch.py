@@ -172,9 +172,12 @@ def generate_single_item(
                     err_detail = f" ({exc.read().decode('utf-8', errors='ignore')})"
                 except Exception:
                     pass
-            print(f"[WARN] {name} attempt {attempt} failed ({elapsed}s): {exc}{err_detail}", flush=True)
+            err_full = f"{exc}{err_detail}"
+            print(f"[WARN] {name} attempt {attempt} failed ({elapsed}s): {err_full}", flush=True)
             if attempt < max_retries:
-                time.sleep(retry_delay * attempt)
+                # NOTE: 针对 reCAPTCHA 或鉴权/风控类错误，执行更充足的指数退避冷却
+                backoff = (retry_delay * 1.6) if any(k in err_full.lower() for k in ("recaptcha", "unusual_activity", "403", "401")) else retry_delay
+                time.sleep(backoff * attempt)
 
     print(f"[ERROR] {name} failed after {max_retries} attempts.", flush=True)
     return False, name, out_file, "failed"
@@ -247,8 +250,8 @@ def main(argv=None):
     parser.add_argument("file", nargs="?", help="Path to text file containing prompts (one per line)")
     parser.add_argument("-t", "--type", choices=["image", "video"], default="image", help="Media type: image or video (default: image)")
     parser.add_argument("-o", "--output", default=None, help="Output directory (default: output_images or output_videos)")
-    parser.add_argument("-c", "--concurrency", type=int, default=int(os.environ.get("MAX_CONCURRENT_REQUESTS", "4")), help="Parallel concurrency (default: 4)")
-    parser.add_argument("-s", "--stagger", type=float, default=float(os.environ.get("REQUEST_MIN_INTERVAL", "2.0")), help="Stagger delay in seconds (default: 2.0s)")
+    parser.add_argument("-c", "--concurrency", type=int, default=int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2")), help="Parallel concurrency (default: 2)")
+    parser.add_argument("-s", "--stagger", type=float, default=float(os.environ.get("REQUEST_MIN_INTERVAL", "2.5")), help="Stagger delay in seconds (default: 2.5s)")
     parser.add_argument("-a", "--aspect", default="landscape", choices=["landscape", "portrait", "square", "4x3", "3x4"], help="Aspect ratio")
     parser.add_argument("-d", "--duration", type=int, choices=[4, 6, 8, 10], default=10, help="Video duration in seconds (for video mode, default: 10)")
     parser.add_argument("-m", "--model", default="narwhal", help="Model name (default: narwhal)")

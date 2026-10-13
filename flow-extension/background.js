@@ -132,30 +132,52 @@ ensureInitialized();
 
 // ─── Token Capture ──────────────────────────────────────────
 
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    if (!details?.requestHeaders?.length) return;
-    const authHeader = details.requestHeaders.find(
-      (h) => h.name?.toLowerCase() === 'authorization',
-    );
-    const value = authHeader?.value || '';
-    if (!value.startsWith('Bearer ya29.')) return;
+function handleCapturedHeaders(details) {
+  if (!details?.requestHeaders?.length) return;
+  const authHeader = details.requestHeaders.find(
+    (h) => h.name?.toLowerCase() === 'authorization',
+  );
+  const value = authHeader?.value || '';
+  const match = value.match(/^Bearer\s+(ya29\.[^\s]+)/i);
+  if (!match) return;
 
-    const token = value.replace(/^Bearer\s+/i, '').trim();
-    if (!token) return;
+  const token = match[1].trim();
+  if (!token) return;
 
-    // Always update — even if same token string, refresh the timestamp
-    flowKey = token;
-    metrics.tokenCapturedAt = Date.now();
-    chrome.storage.local.set({ flowKey, metrics });
-    console.log('[Flow Agent] Bearer token captured');
+  flowKey = token;
+  metrics.tokenCapturedAt = Date.now();
+  chrome.storage.local.set({ flowKey, metrics });
+  console.log('[Flow Agent] Bearer token captured from webRequest');
+  sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+}
 
-    // Notify whichever transport is active.
-    sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
-  },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*', 'https://flow.google.com/*'] },
-  ['requestHeaders', 'extraHeaders'],
-);
+try {
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    handleCapturedHeaders,
+    { urls: [
+      'https://aisandbox-pa.googleapis.com/*',
+      'https://aisandbox-pa.sandbox.googleapis.com/*',
+      'https://labs.google/*',
+      'https://flow.google.com/*',
+      'https://flow-content.google/*'
+    ] },
+    ['requestHeaders', 'extraHeaders'],
+  );
+  console.log('[Flow Agent] Registered onBeforeSendHeaders with extraHeaders');
+} catch (e) {
+  console.warn('[Flow Agent] Fallback to requestHeaders without extraHeaders:', e.message);
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    handleCapturedHeaders,
+    { urls: [
+      'https://aisandbox-pa.googleapis.com/*',
+      'https://aisandbox-pa.sandbox.googleapis.com/*',
+      'https://labs.google/*',
+      'https://flow.google.com/*',
+      'https://flow-content.google/*'
+    ] },
+    ['requestHeaders'],
+  );
+}
 
 let _openingFlowTab = false;
 
@@ -163,7 +185,8 @@ let _openingFlowTab = false;
 // Open the Flow tab only when real work needs it (token capture or captcha).
 // Keep it available in the background so user tabs are never redirected.
 const FLOW_TAB_URLS = ['https://flow.google.com/*', 'https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
-const FLOW_URL = 'https://flow.google.com/';
+const LABS_FLOW_URL = 'https://labs.google/fx/tools/flow';
+const FLOW_URL = 'https://flow.google.com';
 let workTabId = null;
 let flowTabOpening = null;
 let workTabCreatedByExtension = false;
@@ -209,6 +232,18 @@ async function waitForTabComplete(tabId, maxWaitMs = 10000) {
   });
 }
 
+async function getExistingLabsTab() {
+  const allTabs = await chrome.tabs.query({});
+  return allTabs.find(t => t.url && (t.url.includes('labs.google/fx/tools/flow') || t.url.includes('labs.google/fx')));
+}
+
+async function getExistingFlowTab() {
+  const allTabs = await chrome.tabs.query({});
+  const labsTab = allTabs.find(t => t.url && (t.url.includes('labs.google/fx/tools/flow') || t.url.includes('labs.google/fx')));
+  if (labsTab) return labsTab;
+  return allTabs.find(t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google')));
+}
+
 // Finds/wakes/creates the Flow tab. Returns
 // the tab, or null if it couldn't be opened.
 async function _getOrOpenFlowTab() {
@@ -227,11 +262,11 @@ async function _getOrOpenFlowTab() {
     }
   }
 
-  const tabs = await chrome.tabs.query({ url: FLOW_TAB_URLS });
-  if (tabs.length) {
-    workTabId = tabs[0].id;
+  const existingTab = await getExistingFlowTab();
+  if (existingTab) {
+    workTabId = existingTab.id;
     workTabCreatedByExtension = false;
-    return tabs[0];
+    return existingTab;
   }
 
   const createdTab = await chrome.tabs.create({ url: FLOW_URL, active: false });
@@ -272,34 +307,154 @@ function isTokenFresh() {
   return ageMs < 50 * 60 * 1000; // 50 minutes
 }
 
+async function refreshLabsSessionToken() {
+  console.log('[Flow Agent] Initiating NextAuth OAuth session refresh...');
+  try {
+    const csrfResp = await fetch('https://labs.google/fx/api/auth/csrf', { credentials: 'include' });
+    if (!csrfResp.ok) throw new Error(`CSRF fetch failed: HTTP ${csrfResp.status}`);
+    const csrfData = await csrfResp.json();
+    const csrfToken = csrfData?.csrfToken;
+    if (!csrfToken) throw new Error('No csrfToken found');
+
+    const signinResp = await fetch('https://labs.google/fx/api/auth/signin/google', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        csrfToken,
+        callbackUrl: 'https://labs.google/fx/tools/flow',
+        json: 'true',
+      }),
+    });
+    if (!signinResp.ok) throw new Error(`Signin request failed: HTTP ${signinResp.status}`);
+    const signinData = await signinResp.json();
+    const oauthUrl = signinData?.url;
+    if (!oauthUrl) throw new Error('No OAuth redirect URL returned from signin');
+
+    console.log('[Flow Agent] Opening background tab for OAuth handshake...');
+    const tab = await chrome.tabs.create({ url: oauthUrl, active: false });
+
+    await new Promise((resolve) => {
+      let resolved = false;
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      }, 15000);
+
+      function listener(tabId, changeInfo, updatedTab) {
+        if (tabId === tab.id && changeInfo.status === 'complete') {
+          const currentUrl = updatedTab.url || '';
+          if (currentUrl.includes('labs.google/fx') || currentUrl.includes('flow.google.com')) {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timeout);
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          }
+        }
+      }
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch {}
+
+    await sleep(1000);
+
+    const sessionResp = await fetch('https://labs.google/fx/api/auth/session', {
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' },
+    });
+    if (!sessionResp.ok) throw new Error(`Session fetch failed: HTTP ${sessionResp.status}`);
+    const sessionData = await sessionResp.json();
+    if (sessionData?.access_token && sessionData.access_token.startsWith('ya29.')) {
+      flowKey = sessionData.access_token;
+      metrics.tokenCapturedAt = Date.now();
+      await chrome.storage.local.set({ flowKey, metrics });
+      sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+      console.log('[Flow Agent] Captured fresh OAuth token after refresh:', flowKey.slice(0, 15) + '...');
+      return flowKey;
+    }
+  } catch (err) {
+    console.warn('[Flow Agent] refreshLabsSessionToken error:', err.message);
+  }
+  return null;
+}
+
+async function fetchTokenFromSession() {
+  try {
+    const resp = await fetch('https://labs.google/fx/api/auth/session', {
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+
+    let isExpired = false;
+    if (data?.expires) {
+      const expTime = new Date(data.expires).getTime();
+      if (!isNaN(expTime) && expTime <= Date.now() + 60000) {
+        isExpired = true;
+      }
+    }
+
+    if (data?.access_token && data.access_token.startsWith('ya29.') && !isExpired) {
+      flowKey = data.access_token;
+      metrics.tokenCapturedAt = Date.now();
+      await chrome.storage.local.set({ flowKey, metrics });
+      sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+      console.log('[Flow Agent] Captured valid OAuth token from labs auth session');
+      return flowKey;
+    }
+
+    console.log('[Flow Agent] Session token missing or expired, triggering OAuth refresh...');
+    return await refreshLabsSessionToken();
+  } catch (e) {
+    console.warn('[Flow Agent] fetchTokenFromSession error:', e.message);
+  }
+  return null;
+}
+
 async function captureTokenFromFlowTab() {
-  // Skip if token is still fresh — no need to open/refresh anything
   if (isTokenFresh()) {
     console.log('[Flow Agent] Token still fresh, skipping tab refresh');
-    return;
+    return flowKey;
   }
+
+  const sessionToken = await fetchTokenFromSession();
+  if (sessionToken) return sessionToken;
 
   if (_openingFlowTab) {
     console.log('[Flow Agent] Flow tab already opening, skipping');
-    return;
+    return null;
   }
   _openingFlowTab = true;
   try {
-    const tab = await getOrOpenFlowTab();
-    if (!tab) {
-      console.log('[Flow Agent] Flow tab not ready yet after open');
-      return;
+    let tab = await getExistingLabsTab();
+    if (tab) {
+      console.log('[Flow Agent] Found existing labs.google tab, reloading:', tab.id);
+      await chrome.tabs.reload(tab.id);
+      await waitForTabComplete(tab.id, 15000);
+    } else {
+      console.log('[Flow Agent] No labs.google tab found, creating background tab on labs.google for token capture');
+      tab = await chrome.tabs.create({ url: LABS_FLOW_URL, active: false });
+      workTabId = tab.id;
+      workTabCreatedByExtension = true;
+      await waitForTabComplete(tab.id, 15000);
     }
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content.js'],
-    });
-    console.log('[Flow Agent] Token refresh triggered on Flow tab');
+    await sleep(2000);
+    return await fetchTokenFromSession();
   } catch (e) {
     console.error('[Flow Agent] Token refresh failed:', e);
   } finally {
     _openingFlowTab = false;
   }
+  return null;
 }
 
 
@@ -365,110 +520,7 @@ async function connectToAgent() {
   ws.onmessage = async ({ data }) => {
     try {
       const msg = JSON.parse(data);
-
-      if (msg.method === 'api_request') {
-        await handleApiRequest(msg);
-      } else if (msg.method === 'get_media_url') {
-        await handleGetMediaUrl(msg);
-      } else if (msg.method === 'trpc_request') {
-        await handleTrpcRequest(msg);
-      } else if (msg.method === 'upload_video') {
-        await handleUploadVideo(msg);
-      } else if (msg.method === 'solve_captcha') {
-        await handleSolveCaptcha(msg);
-      } else if (msg.method === 'reload_extension') {
-        chrome.runtime.reload();
-      } else if (msg.method === 'get_status') {
-        sendToAgent({
-          id: msg.id,
-          result: {
-            state,
-            flowKeyPresent: !!flowKey,
-            manualDisconnect,
-            tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-            metrics,
-          },
-        });
-      } else if (msg.method === 'open_flow_tab') {
-        // Python bridge asks us to open/focus a Flow tab
-        // If token is still fresh, just send it back — no need to open/reload
-        if (isTokenFresh()) {
-          console.log('[Flow Agent] open_flow_tab: token fresh, sending cached token');
-          sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
-        } else {
-          console.log('[Flow Agent] open_flow_tab: token missing/expired, opening tab');
-          const tabs = await chrome.tabs.query({
-            url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-          });
-          if (tabs.length) {
-            await chrome.tabs.reload(tabs[0].id);
-            console.log('[Flow Agent] Refreshed existing Flow tab');
-          } else {
-            await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: true });
-            console.log('[Flow Agent] Opened new Flow tab');
-          }
-          await sleep(5000);
-          if (flowKey && ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-            console.log('[Flow Agent] Sent token after tab open');
-          } else {
-            const data = await chrome.storage.local.get(['flowKey']);
-            if (data.flowKey) {
-              flowKey = data.flowKey;
-              if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-                console.log('[Flow Agent] Sent token from storage after tab open');
-              }
-            }
-          }
-        }
-      } else if (msg.method === 'refresh_flow_tab' || msg.method === 'force_refresh') {
-        // Python bridge asks us to refresh token.
-        // force_refresh (or an explicit msg.force) bypasses the freshness check:
-        // Google can invalidate a token via inactivity long before its 50-min
-        // age limit, so a "fresh" token may still be dead (401). In that case we
-        // must actually reload the tab and re-capture, not resend the cached one.
-        const force = msg.force === true || msg.method === 'force_refresh';
-        if (isTokenFresh() && !force) {
-          console.log('[Flow Agent] refresh_flow_tab: token fresh, sending cached token');
-          if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-          }
-        } else {
-          console.log('[Flow Agent] refresh_flow_tab: forcing tab reload + re-capture');
-          // Drop the stale token so captureTokenFromFlowTab can't short-circuit.
-          if (force) {
-            flowKey = null;
-            metrics.tokenCapturedAt = null;
-          }
-          await captureTokenFromFlowTab();
-          await sleep(3000);
-          if (flowKey && ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-            console.log('[Flow Agent] Sent token after refresh');
-          } else {
-            const data = await chrome.storage.local.get(['flowKey']);
-            if (data.flowKey) {
-              flowKey = data.flowKey;
-              if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-                console.log('[Flow Agent] Sent token from storage after refresh');
-              }
-            }
-          }
-        }
-      } else if (msg.type === 'callback_config') {
-        callbackSecret = msg.secret;
-        callbackUrl = normalizeCallbackUrl(msg.callback_url);
-        chrome.storage.local.set({ callbackSecret: msg.secret, callbackUrl });
-        console.log('[Flow Agent] Received callback config:', callbackUrl);
-      } else if (msg.type === 'callback_secret') {
-        callbackSecret = msg.secret;
-        chrome.storage.local.set({ callbackSecret: msg.secret });
-        console.log('[Flow Agent] Received callback secret');
-      } else if (msg.type === 'pong') {
-        // keepalive response
-      }
+      await handleAgentCommand(msg);
     } catch (e) {
       console.error('[Flow Agent] Message error:', e);
     }
@@ -484,6 +536,410 @@ async function connectToAgent() {
     metrics.lastError = 'WS_ERROR';
     chrome.storage.local.set({ metrics });
   };
+}
+
+async function handleAgentCommand(msg) {
+  if (!msg) return;
+  try {
+    if (msg.method === 'api_request') {
+      await handleApiRequest(msg);
+    } else if (msg.method === 'get_media_url') {
+      await handleGetMediaUrl(msg);
+    } else if (msg.method === 'trpc_request') {
+      await handleTrpcRequest(msg);
+    } else if (msg.method === 'upload_video') {
+      await handleUploadVideo(msg);
+    } else if (msg.method === 'solve_captcha') {
+      await handleSolveCaptcha(msg);
+    } else if (msg.method === 'reload_extension') {
+      chrome.runtime.reload();
+    } else if (msg.method === 'open_tab') {
+      const tab = await chrome.tabs.create({ url: msg.params?.url || 'https://flow.google.com', active: true });
+      sendToAgent({ id: msg.id, result: { ok: true, tabId: tab.id, url: tab.url } });
+    } else if (msg.method === 'eval_tab') {
+      const { tabId, urlPattern, action = 'GET_PAGE_INFO', payload = {} } = msg.params || {};
+      try {
+        let targetId = tabId;
+        if (!targetId) {
+          const allTabs = await chrome.tabs.query({});
+          const pattern = urlPattern || 'flow.google.com/project';
+          const found = allTabs.find(t => t.url && t.url.includes(pattern));
+          if (found) targetId = found.id;
+          else if (allTabs.length) targetId = allTabs[0].id;
+        }
+        if (!targetId) throw new Error('No matching tab found');
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetId },
+          world: 'MAIN',
+          func: async (act, pl, key) => {
+            try {
+              if (act === 'GET_PAGE_INFO') {
+                const buttons = Array.from(document.querySelectorAll('button, div[role="button"]')).map(b => ({
+                  text: b.innerText?.trim()?.slice(0, 50),
+                  ariaLabel: b.getAttribute('aria-label'),
+                  role: b.getAttribute('role'),
+                  disabled: b.disabled || b.getAttribute('aria-disabled') === 'true'
+                })).filter(b => b.text || b.ariaLabel);
+                const inputs = Array.from(document.querySelectorAll('textarea, input')).map(i => ({
+                  tag: i.tagName,
+                  placeholder: i.placeholder,
+                  value: i.value?.slice(0, 50),
+                  ariaLabel: i.getAttribute('aria-label')
+                }));
+                return {
+                  success: true,
+                  result: {
+                    url: window.location.href,
+                    title: document.title,
+                    buttons: buttons.slice(0, 50),
+                    inputs: inputs.slice(0, 20),
+                  }
+                };
+              }
+              if (act === 'GET_PERF_ENTRIES') {
+                const entries = performance.getEntriesByType('resource')
+                  .map(r => r.name)
+                  .filter(u => u.includes('googleapis') || u.includes('/fx/') || u.includes('/api/'));
+                return { success: true, result: entries.slice(-30) };
+              }
+              if (act === 'GENERATE_VIDEO_NATIVE') {
+                const { prompt, aspect, duration, startImageId, endImageId, projectId, seed } = pl;
+                const siteKey = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+                let recaptchaToken = '';
+                if (window.grecaptcha?.enterprise?.execute) {
+                  recaptchaToken = await window.grecaptcha.enterprise.execute(siteKey, { action: 'VIDEO_GENERATION' });
+                } else if (window.grecaptcha?.execute) {
+                  recaptchaToken = await window.grecaptcha.execute(siteKey, { action: 'VIDEO_GENERATION' });
+                }
+                const modelKey = `abra_t2v_${duration}s`;
+                const body = {
+                  mediaGenerationContext: { batchId: crypto.randomUUID() },
+                  clientContext: {
+                    projectId: projectId,
+                    tool: "PINHOLE",
+                    userPaygateTier: "PAYGATE_TIER_ONE",
+                    sessionId: `;${Date.now()}`,
+                    recaptchaContext: {
+                      applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
+                      token: recaptchaToken
+                    }
+                  },
+                  requests: [{
+                    aspectRatio: aspect,
+                    textInput: { structuredPrompt: { parts: [{ text: prompt }] } },
+                    videoModelKey: modelKey,
+                    seed: seed || Math.floor(Math.random() * 9999) + 1,
+                    metadata: {},
+                    startImage: { mediaId: startImageId },
+                    endImage: { mediaId: endImageId }
+                  }],
+                  useV2ModelConfig: true
+                };
+                const resp = await window.fetch(`https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartAndEndImage?key=AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'authorization': `Bearer ${key}`
+                  },
+                  body: JSON.stringify(body)
+                });
+                const resData = await resp.json().catch(() => ({}));
+                return {
+                  success: true,
+                  result: {
+                    status: resp.status,
+                    ok: resp.ok,
+                    data: resData
+                  }
+                };
+              }
+              if (act === 'PAGE_FETCH') {
+                const { url, options } = pl;
+                const resp = await window.fetch(url, options);
+                const contentType = resp.headers.get('content-type') || '';
+                let data;
+                if (contentType.includes('application/json')) {
+                  data = await resp.json().catch(() => null);
+                } else {
+                  data = await resp.text().catch(() => '');
+                }
+                return {
+                  success: true,
+                  result: {
+                    status: resp.status,
+                    ok: resp.ok,
+                    data
+                  }
+                };
+              }
+              if (act === 'QUERY_DOM') {
+                const { selector } = pl;
+                const els = Array.from(document.querySelectorAll(selector)).map(el => ({
+                  text: el.innerText?.trim(),
+                  html: el.outerHTML?.slice(0, 300),
+                  ariaLabel: el.getAttribute('aria-label')
+                }));
+                return { success: true, result: els };
+              }
+              if (act === 'CLICK') {
+                const { selector, textMatch } = pl;
+                let target = null;
+                if (selector) {
+                  const list = Array.from(document.querySelectorAll(selector));
+                  if (textMatch) {
+                    target = list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                  } else {
+                    target = list[0];
+                  }
+                }
+                if (!target && textMatch) {
+                  const all = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                  target = all.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                }
+                if (target) {
+                  target.scrollIntoView({ behavior: 'instant', block: 'center' });
+                  target.click();
+                  return { success: true, result: { clicked: true, text: target.innerText?.trim() || target.getAttribute('aria-label') } };
+                }
+                return { success: false, error: 'Target element not found' };
+              }
+              if (act === 'INPUT_TEXT') {
+                const { selector, text } = pl;
+                const el = document.querySelector(selector || 'textarea');
+                if (!el) return { success: false, error: 'Input element not found' };
+                el.focus();
+                el.value = text;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return { success: true, result: { value: el.value } };
+              }
+              return { success: false, error: `Unknown action: ${act}` };
+            } catch (err) {
+              return { success: false, error: err.message, stack: err.stack };
+            }
+          },
+          args: [action, payload, flowKey],
+        });
+        const evalRes = results?.[0]?.result;
+        sendToAgent({ id: msg.id, result: evalRes });
+      } catch (err) {
+        sendToAgent({ id: msg.id, result: { success: false, error: err.message } });
+      }
+    } else if (msg.method === 'get_status') {
+      const allTabs = await chrome.tabs.query({});
+      const flowTabs = allTabs.filter(t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google')));
+      sendToAgent({
+        id: msg.id,
+        result: {
+          state,
+          flowKeyPresent: !!flowKey,
+          flowKeySample: flowKey ? flowKey.slice(0, 15) + '...' : null,
+          tabCount: allTabs.length,
+          flowTabs: flowTabs.map(t => ({ id: t.id, url: t.url, title: t.title })),
+          manualDisconnect,
+          tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+          metrics,
+        },
+      });
+    } else if (msg.method === 'probe_token') {
+      try {
+        if (!msg.force && !msg.inspect) {
+          const storage = await chrome.storage.local.get(['flowKey', 'metrics']);
+          if (storage.flowKey) {
+            flowKey = storage.flowKey;
+            sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+            sendToAgent({ id: msg.id, result: { found: true, source: 'storage', tokenSample: flowKey.slice(0, 15) + '...' } });
+            return;
+          }
+        } else if (msg.force) {
+          console.log('[Flow Agent] probe_token: force refresh requested');
+          flowKey = null;
+          metrics.tokenCapturedAt = null;
+          await chrome.storage.local.remove(['flowKey', 'metrics']);
+          const refreshedToken = await refreshLabsSessionToken();
+          if (refreshedToken) {
+            sendToAgent({ id: msg.id, result: { found: true, source: 'nextauth_refresh', tokenSample: refreshedToken.slice(0, 15) + '...' } });
+            return;
+          }
+        }
+
+        const tab = await getExistingFlowTab();
+        if (!tab) {
+          sendToAgent({ id: msg.id, result: { found: false, reason: 'no_flow_tab_open' } });
+          return;
+        }
+
+        if (msg.url) {
+          console.log('[Flow Agent] Navigating tab to', msg.url);
+          await chrome.tabs.update(tab.id, { url: msg.url });
+          await waitForTabComplete(tab.id, 15000);
+          await sleep(4000);
+        }
+
+        if (msg.click_selector) {
+          console.log('[Flow Agent] Clicking selector:', msg.click_selector);
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            func: (sel) => {
+              const el = document.querySelector(sel);
+              if (el) el.click();
+            },
+            args: [msg.click_selector]
+          });
+          await sleep(5000);
+        }
+
+        const evalResults = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          func: () => {
+            const foundTokens = [];
+            // 1. Search localStorage & sessionStorage
+            try {
+              for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                const v = localStorage.getItem(k);
+                if (v && v.includes('ya29.')) foundTokens.push({ source: 'localStorage', key: k, token: (v.match(/ya29\.[^\s"'\\]+/) || [])[0] });
+              }
+              for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                const v = sessionStorage.getItem(k);
+                if (v && v.includes('ya29.')) foundTokens.push({ source: 'sessionStorage', key: k, token: (v.match(/ya29\.[^\s"'\\]+/) || [])[0] });
+              }
+            } catch {}
+
+            // 2. Search WIZ_global_data or window properties
+            try {
+              if (window.WIZ_global_data) {
+                for (const [k, v] of Object.entries(window.WIZ_global_data)) {
+                  if (typeof v === 'string' && v.includes('ya29.')) {
+                    foundTokens.push({ source: 'WIZ_global_data', key: k, token: (v.match(/ya29\.[^\s"'\\]+/) || [])[0] });
+                  }
+                }
+              }
+            } catch {}
+
+            // 3. Inspect recent API calls from performance entries
+            let apiUrls = [];
+            try {
+              apiUrls = performance.getEntriesByType('resource')
+                .map(r => r.name)
+                .filter(u => u.includes('googleapis.com') || u.includes('/fx/') || u.includes('/api/'))
+                .slice(-20);
+            } catch {}
+
+            let grecaptchaInfo = {
+              hasGrecaptcha: typeof window.grecaptcha !== 'undefined',
+              hasEnterprise: !!window.grecaptcha?.enterprise,
+              visibilityState: document.visibilityState,
+              hasFocus: document.hasFocus(),
+              scripts: Array.from(document.querySelectorAll('script[src*="recaptcha"]')).map(s => s.src),
+            };
+
+            let images = [];
+            try {
+              images = Array.from(document.querySelectorAll('img')).map(el => el.src).filter(u => u && !u.startsWith('data:image/svg'));
+            } catch {}
+
+            let elements = [];
+            try {
+              elements = Array.from(document.querySelectorAll('a, button')).map(el => ({
+                tag: el.tagName,
+                text: el.innerText ? el.innerText.trim().slice(0, 50) : '',
+                href: el.href || el.getAttribute('href') || ''
+              })).filter(x => x.text || x.href);
+            } catch {}
+
+            return {
+              url: window.location.href,
+              title: document.title,
+              grecaptchaInfo,
+              elements: elements.slice(0, 30),
+              apiUrls,
+              images: Array.from(new Set(images)),
+            };
+          },
+        });
+
+        // Test NextAuth signin flow
+        let nextAuthResult = {};
+        try {
+          const csrfResp = await fetch('https://labs.google/fx/api/auth/csrf', { credentials: 'include' });
+          const csrfData = await csrfResp.json().catch(() => null);
+          const csrfToken = csrfData?.csrfToken;
+          nextAuthResult.csrfToken = csrfToken;
+
+          if (csrfToken) {
+            const signinResp = await fetch('https://labs.google/fx/api/auth/signin/google', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ csrfToken, callbackUrl: 'https://labs.google/fx/tools/flow', json: 'true' }),
+            });
+            const signinData = await signinResp.json().catch(() => null);
+            nextAuthResult.signinStatus = signinResp.status;
+            nextAuthResult.redirectUrl = signinData?.url;
+          }
+        } catch (e) {
+          nextAuthResult.error = e.message;
+        }
+
+        const probeData = evalResults?.[0]?.result || {};
+        sendToAgent({ id: msg.id, result: { found: !!flowKey, probeData, nextAuthResult } });
+      } catch (err) {
+        sendToAgent({ id: msg.id, result: { found: false, error: err.message } });
+      }
+    } else if (msg.method === 'open_flow_tab') {
+      if (isTokenFresh()) {
+        console.log('[Flow Agent] open_flow_tab: token fresh, sending cached token');
+        sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+      } else {
+        console.log('[Flow Agent] open_flow_tab: token missing/expired, capturing...');
+        const token = await captureTokenFromFlowTab();
+        if (token) {
+          sendToAgent({ type: 'token_captured', flowKey: token, clientId: extensionClientId });
+        }
+      }
+    } else if (msg.method === 'refresh_flow_tab' || msg.method === 'force_refresh') {
+      const force = msg.force === true || msg.method === 'force_refresh';
+      if (force) {
+        flowKey = null;
+        metrics.tokenCapturedAt = null;
+        await chrome.storage.local.remove(['flowKey']);
+      }
+      if (isTokenFresh() && !force) {
+        console.log('[Flow Agent] refresh_flow_tab: token fresh, sending cached token');
+        sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+      } else if (force) {
+        console.log('[Flow Agent] force_refresh: performing NextAuth OAuth handshake...');
+        const token = await refreshLabsSessionToken();
+        if (token) {
+          sendToAgent({ type: 'token_captured', flowKey: token, clientId: extensionClientId });
+        }
+      } else {
+        console.log('[Flow Agent] refresh_flow_tab: refreshing token...');
+        const token = await captureTokenFromFlowTab();
+        if (token) {
+          sendToAgent({ type: 'token_captured', flowKey: token, clientId: extensionClientId });
+        }
+      }
+    } else if (msg.type === 'callback_config') {
+      callbackSecret = msg.secret;
+      callbackUrl = normalizeCallbackUrl(msg.callback_url);
+      chrome.storage.local.set({ callbackSecret: msg.secret, callbackUrl });
+      console.log('[Flow Agent] Received callback config:', callbackUrl);
+    } else if (msg.type === 'callback_secret') {
+      callbackSecret = msg.secret;
+      chrome.storage.local.set({ callbackSecret: msg.secret });
+      console.log('[Flow Agent] Received callback secret');
+    } else if (msg.type === 'pong') {
+      // keepalive response
+    }
+  } catch (e) {
+    console.error('[Flow Agent] handleAgentCommand error:', e);
+  }
 }
 
 function agentHttpBase() {
@@ -547,9 +1003,9 @@ async function pollHttpCommands() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     const commands = data.commands || [];
-    if (commands.length > 0 && typeof ws?.onmessage === 'function') {
+    if (commands.length > 0) {
       commands.forEach((command) => {
-        Promise.resolve(ws.onmessage({ data: JSON.stringify(command) })).catch((err) => {
+        handleAgentCommand(command).catch((err) => {
           console.error('[Flow Agent] Command execution error:', err);
         });
       });
@@ -567,6 +1023,9 @@ function scheduleReconnect() {
 }
 
 function keepAlive() {
+  if (!isTokenFresh()) {
+    fetchTokenFromSession().catch(() => {});
+  }
   if (httpConnected) {
     connectHttpAgent();
   } else if (ws?.readyState === WebSocket.OPEN) {
@@ -713,67 +1172,157 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
 
 const RECAPTCHA_SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
+let _captchaMutex = Promise.resolve();
+
 async function solveCaptcha(requestId, captchaAction) {
+  const currentMutex = _captchaMutex;
+  let releaseMutex;
+  _captchaMutex = new Promise(resolve => { releaseMutex = resolve; });
+
+  try {
+    await currentMutex;
+  } catch {}
+
+  try {
+    return await _solveCaptchaInternal(requestId, captchaAction);
+  } finally {
+    await sleep(350); // Small cooldown gap between sequential captcha solves
+    releaseMutex();
+  }
+}
+
+async function _solveCaptchaInternal(requestId, captchaAction) {
   let targetTabId = null;
   let isTempTab = false;
   const scriptTimeoutMs = captchaAction === 'VIDEO_GENERATION' ? 30000 : 20000;
 
   try {
     const allTabs = await chrome.tabs.query({});
-    const existingTab = allTabs.find(t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google')));
+    // NOTE: 优先选取 labs.google/fx 页面以匹配 Origin: https://labs.google，次选 flow.google.com/project
+    let existingTab = allTabs.slice().reverse().find(t => t.url && t.url.includes('labs.google/fx') && !t.url.includes('labs.google/fx/tools/flow'));
+    if (!existingTab) {
+      existingTab = allTabs.slice().reverse().find(t => t.url && (t.url.includes('flow.google.com/project') || t.url.includes('labs.google/fx/tools/flow/project')));
+    }
+    if (!existingTab) {
+      existingTab = allTabs.slice().reverse().find(t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google')));
+    }
     if (existingTab) {
       targetTabId = existingTab.id;
+      try {
+        await chrome.tabs.update(targetTabId, { active: true });
+        if (existingTab.windowId) {
+          await chrome.windows.update(existingTab.windowId, { focused: true, state: 'normal' });
+        }
+        await sleep(500);
+      } catch {}
+      if (existingTab.discarded) {
+        await chrome.tabs.reload(targetTabId);
+        await waitForTabComplete(targetTabId);
+        await sleep(1500);
+      }
     } else {
-      const newTab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+      const newTab = await chrome.tabs.create({ url: FLOW_URL, active: true });
       targetTabId = newTab.id;
       isTempTab = true;
       await waitForTabComplete(targetTabId);
       await sleep(1500);
     }
 
+    // Attempt 1: Direct message to content.js -> injected.js in the page
+    try {
+      const tabResp = await Promise.race([
+        requestCaptchaFromTab(targetTabId, requestId, captchaAction),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('TAB_CAPTCHA_TIMEOUT')), 8000)),
+      ]);
+      if (tabResp && tabResp.token) {
+        return { token: tabResp.token };
+      }
+    } catch (e) {
+      console.warn('[Flow Agent] requestCaptchaFromTab error, trying fallback:', e.message);
+    }
+
+    // Attempt 2: Fallback to executeScript in MAIN world without violating TrustedScriptURL
     const results = await chrome.scripting.executeScript({
       target: { tabId: targetTabId },
       world: 'MAIN',
       func: async (action, siteKey, timeoutMs) => {
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
           let settled = false;
-          const finish = (fn, value) => {
+          const finish = (value) => {
             if (settled) return;
             settled = true;
-            fn(value);
+            resolve(value);
           };
           try {
-            function run() {
-              if (window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.ready === 'function') {
-                window.grecaptcha.enterprise.ready(function() {
-                  window.grecaptcha.enterprise.execute(siteKey, { action: action })
-                    .then((token) => finish(resolve, { token }))
-                    .catch((err) => finish(reject, err?.message || 'reCAPTCHA evaluation failed internally'));
-                });
-              } else if (window.grecaptcha && typeof window.grecaptcha.ready === 'function') {
-                window.grecaptcha.ready(function() {
-                  window.grecaptcha.execute(siteKey, { action: action })
-                    .then((token) => finish(resolve, { token }))
-                    .catch((err) => finish(reject, err?.message || 'reCAPTCHA evaluation failed'));
-                });
-              } else {
-                finish(reject, 'grecaptcha object not available');
+            try {
+              Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+              Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+              document.hasFocus = () => true;
+              window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 200 }));
+            } catch (e) {}
+
+            async function run() {
+              const exec = async (act) => {
+                const call = () => {
+                  if (window.grecaptcha?.enterprise?.execute) {
+                    return window.grecaptcha.enterprise.execute(siteKey, act ? { action: act } : undefined);
+                  }
+                  if (window.grecaptcha?.execute) {
+                    return window.grecaptcha.execute(siteKey, act ? { action: act } : undefined);
+                  }
+                  throw new Error('grecaptcha execute unavailable');
+                };
+                return await Promise.race([
+                  Promise.resolve().then(call),
+                  new Promise((_, rej) => setTimeout(() => rej(new Error('EXEC_TIMEOUT')), 5000))
+                ]);
+              };
+
+              try {
+                const token = await exec(action);
+                if (token) return finish({ token });
+              } catch (err1) {
+                try {
+                  const token2 = await exec('IMAGE_GENERATION');
+                  if (token2) return finish({ token: token2 });
+                } catch (err2) {
+                  try {
+                    const token3 = await exec(null);
+                    if (token3) return finish({ token: token3 });
+                  } catch (err3) {
+                    if (window.grecaptcha?.enterprise?.ready) {
+                      window.grecaptcha.enterprise.ready(() => {
+                        exec(action || 'IMAGE_GENERATION')
+                          .then(tok => finish({ token: tok }))
+                          .catch(e => finish({ error: e?.message || 'reCAPTCHA execution failed' }));
+                      });
+                      return;
+                    }
+                    finish({ error: err3?.message || err1?.message || 'reCAPTCHA execution failed' });
+                  }
+                }
               }
             }
 
             if (typeof window.grecaptcha !== 'undefined' && (window.grecaptcha.enterprise || window.grecaptcha.execute)) {
               run();
             } else {
-              const s = document.createElement('script');
-              s.src = `https://www.google.com/recaptcha/enterprise.js?render=${siteKey}`;
-              s.onload = () => { setTimeout(run, 500); };
-              s.onerror = () => finish(reject, 'Failed to load enterprise.js via network');
-              (document.head || document.documentElement).appendChild(s);
+              let waited = 0;
+              const poll = setInterval(() => {
+                waited += 250;
+                if (typeof window.grecaptcha !== 'undefined' && (window.grecaptcha.enterprise || window.grecaptcha.execute)) {
+                  clearInterval(poll);
+                  run();
+                } else if (waited >= timeoutMs) {
+                  clearInterval(poll);
+                  finish({ error: 'Timeout waiting for grecaptcha in page' });
+                }
+              }, 250);
             }
 
-            setTimeout(() => finish(reject, 'Timeout generating reCAPTCHA locally'), timeoutMs);
+            setTimeout(() => finish({ error: 'Timeout generating reCAPTCHA locally' }), timeoutMs);
           } catch (e) {
-            finish(reject, e.message);
+            finish({ error: e.message });
           }
         });
       },
@@ -784,7 +1333,7 @@ async function solveCaptcha(requestId, captchaAction) {
     if (res && res.token) {
       return { token: res.token };
     }
-    return { error: 'No token returned from page' };
+    return { error: res?.error || 'No token returned from page' };
   } catch (e) {
     return { error: e.message || 'Script execution failed' };
   } finally {
@@ -940,10 +1489,31 @@ async function handleApiRequest(msg) {
         const captchaResult = await solveCaptcha(id, captchaAction);
         captchaToken = captchaResult?.token || null;
         if (!captchaToken) {
-          console.warn(`[Flow Agent] Captcha not obtained (${captchaResult?.error}), proceeding with authenticated session...`);
+          const errDetail = captchaResult?.error || 'Failed to acquire reCAPTCHA token';
+          console.error(`[Flow Agent] Captcha error: ${errDetail}. Aborting request to prevent Google 403 / account flagging.`);
+          sendToAgent({
+            id,
+            status: 403,
+            error: `RECAPTCHA_FAILED: ${errDetail}. Ensure Chrome has an active flow.google.com tab visible.`,
+          });
+          if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `RECAPTCHA_FAILED: ${errDetail}`; }
+          chrome.storage.local.set({ metrics });
+          updateRequestLog(logId, { status: 'failed', error: `RECAPTCHA_FAILED: ${errDetail}` });
+          setState('idle');
+          return;
         }
       } catch (err) {
-        console.warn('[Flow Agent] Captcha solver exception, proceeding:', err.message);
+        console.error('[Flow Agent] Captcha solver exception, aborting request:', err.message);
+        sendToAgent({
+          id,
+          status: 403,
+          error: `RECAPTCHA_EXCEPTION: ${err.message}`,
+        });
+        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `RECAPTCHA_EXCEPTION: ${err.message}`; }
+        chrome.storage.local.set({ metrics });
+        updateRequestLog(logId, { status: 'failed', error: `RECAPTCHA_EXCEPTION: ${err.message}` });
+        setState('idle');
+        return;
       }
     }
 
@@ -998,10 +1568,17 @@ async function handleApiRequest(msg) {
     // request / refresh forces a genuine tab reload + re-capture instead of
     // resending the same dead token.
     if (response.status === 401) {
-      console.warn('[Flow Agent] 401 UNAUTHENTICATED — invalidating cached token to force refresh');
+      console.warn('[Flow Agent] 401 UNAUTHENTICATED on request: dropping dead token and initiating session refresh');
       flowKey = null;
       metrics.tokenCapturedAt = null;
-      chrome.storage.local.set({ flowKey: null });
+      chrome.storage.local.remove(['flowKey']);
+      setTimeout(() => {
+        refreshLabsSessionToken().then(token => {
+          if (token) {
+            sendToAgent({ type: 'token_captured', flowKey: token, clientId: extensionClientId });
+          }
+        }).catch(() => {});
+      }, 100);
     }
 
     sendToAgent({
@@ -1158,13 +1735,13 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'OPEN_FLOW_TAB') {
     chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+      url: FLOW_TAB_URLS,
     }).then((tabs) => {
       if (tabs.length) {
         chrome.tabs.update(tabs[0].id, { active: true });
         reply({ ok: true, tabId: tabs[0].id });
       } else {
-        chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow' })
+        chrome.tabs.create({ url: FLOW_URL })
           .then((tab) => reply({ ok: true, tabId: tab.id }))
           .catch((e) => reply({ error: e.message }));
       }
@@ -1176,6 +1753,16 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     captureTokenFromFlowTab()
       .then(() => reply({ ok: true }))
       .catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'CAPTURED_PAGE_TOKEN' && msg.token) {
+    flowKey = msg.token;
+    metrics.tokenCapturedAt = Date.now();
+    chrome.storage.local.set({ flowKey, metrics });
+    console.log('[Flow Agent] Injected page token captured and synced');
+    sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
+    reply({ ok: true });
     return true;
   }
 

@@ -6,11 +6,12 @@ token refresh, and health/liveness endpoints.
 """
 
 import time
+import uuid
 import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Header, WebSocket, Request, Query
+from fastapi import APIRouter, HTTPException, Depends, Header, WebSocket, Request, Query, Body
 from fastapi.responses import JSONResponse
 
 from flow_server import state
@@ -173,6 +174,114 @@ async def refresh_tokens(x_client_id: Optional[str] = Header(None, alias="X-Clie
 
     results = await asyncio.gather(*[_nudge(cid) for cid in targets])
     return {"nudged": len(results), "clients": results}
+
+
+@router.post("/v1/system/reload-extension")
+async def reload_extension():
+    """Instruct all connected extension clients to reload, picking up new code."""
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not initialized")
+    clients = list(bridge._clients.keys())
+    if not clients:
+        return {"reloaded": 0, "clients": [], "detail": "No WebSocket clients connected"}
+
+    async def _reload(cid):
+        try:
+            await bridge.send_message_to(cid, {"method": "reload_extension"})
+            return {"client_id": cid, "ok": True}
+        except Exception as e:
+            return {"client_id": cid, "ok": False, "error": str(e)}
+
+    results = await asyncio.gather(*[_reload(cid) for cid in clients])
+    return {"reloaded": len(results), "clients": results}
+
+
+@router.post("/v1/system/token")
+async def set_token(body: dict = Body(...)):
+    """Directly set or inject a flow key into the bridge for quick headless recovery."""
+    token = body.get("token") or body.get("flow_key") or body.get("flowKey")
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required")
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    # Store token for default client or all connected clients
+    for cid in bridge._clients:
+        bridge._tokens[cid] = token
+    bridge._tokens["__direct__"] = token
+    bridge._connected.set()
+    return {"ok": True, "token_length": len(token)}
+
+
+@router.post("/v1/system/probe-token")
+async def probe_token(body: Optional[dict] = Body(default=None)):
+    """Ask connected extension clients to actively probe token from open Flow tabs."""
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    clients = list(bridge._clients.keys())
+    if not clients:
+        return {"ok": False, "detail": "No WebSocket clients connected"}
+
+    payload = body or {}
+
+    async def _probe(cid):
+        req_id = str(uuid.uuid4())
+        fut = bridge._loop.create_future()
+        bridge._pending[req_id] = fut
+        try:
+            msg = {"id": req_id, "method": "probe_token", **payload}
+            sent = await bridge.send_message_to(cid, msg)
+            if not sent:
+                return {"client_id": cid, "ok": False, "error": "send failed"}
+            res = await asyncio.wait_for(fut, timeout=25)
+            return {"client_id": cid, "ok": True, "result": res}
+        except Exception as e:
+            return {"client_id": cid, "ok": False, "error": str(e)}
+        finally:
+            bridge._pending.pop(req_id, None)
+
+    results = await asyncio.gather(*[_probe(cid) for cid in clients])
+    return {"probed": len(results), "clients": results, "has_flow_key": bridge.has_flow_key()}
+
+
+@router.post("/v1/system/reload-extension")
+async def reload_extension():
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    clients = list(bridge._clients.keys())
+    for cid in clients:
+        msg = {"id": str(uuid.uuid4()), "method": "reload_extension"}
+        await bridge.send_message_to(cid, msg)
+    return {"reloading": len(clients), "clients": clients}
+
+
+@router.post("/v1/system/eval-tab")
+async def eval_tab(body: dict = Body(...), x_client_id: Optional[str] = Header(None, alias="X-Client-Id")):
+    """Execute arbitrary JavaScript in an extension client's tab (MAIN world)."""
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    client_id = x_client_id or body.get("client_id") or "client-jhbh11"
+    req_id = str(uuid.uuid4())
+    fut = bridge._loop.create_future()
+    bridge._pending[req_id] = fut
+    try:
+        msg = {"id": req_id, "method": "eval_tab", "params": body}
+        sent = await bridge.send_message_to(client_id, msg)
+        if not sent:
+            raise HTTPException(status_code=500, detail="Send failed")
+        timeout_sec = float(body.get("timeout", 45))
+        res = await asyncio.wait_for(fut, timeout=timeout_sec)
+        return res
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Tab eval execution timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        bridge._pending.pop(req_id, None)
 
 
 @router.get("/")
