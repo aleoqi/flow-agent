@@ -358,7 +358,19 @@ class HistoryRegistry:
                 history_file.write("\n")
                 history_file.flush()
                 os.fsync(history_file.fileno())
-            os.replace(temporary_path, self.path)
+            for attempt in range(15):
+                try:
+                    os.replace(temporary_path, self.path)
+                    break
+                except OSError:
+                    if attempt == 14:
+                        try:
+                            import shutil
+                            shutil.copyfile(temporary_path, self.path)
+                            break
+                        except Exception:
+                            raise
+                    time.sleep(0.1 * (attempt + 1))
         finally:
             if os.path.exists(temporary_path):
                 try:

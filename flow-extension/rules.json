@@ -5,8 +5,8 @@
     "action": {
       "type": "modifyHeaders",
       "requestHeaders": [
-        { "header": "Origin", "operation": "set", "value": "https://flow.google.com" },
-        { "header": "Referer", "operation": "set", "value": "https://flow.google.com/" }
+        { "header": "Origin", "operation": "set", "value": "https://labs.google" },
+        { "header": "Referer", "operation": "set", "value": "https://labs.google/" }
       ]
     },
     "condition": {

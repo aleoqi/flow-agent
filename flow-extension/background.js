@@ -125,8 +125,8 @@ async function init() {
           action: {
             type: 'modifyHeaders',
             requestHeaders: [
-              { header: 'Origin', operation: 'set', value: 'https://flow.google.com' },
-              { header: 'Referer', operation: 'set', value: 'https://flow.google.com/' }
+              { header: 'Origin', operation: 'set', value: 'https://labs.google' },
+              { header: 'Referer', operation: 'set', value: 'https://labs.google/' }
             ]
           },
           condition: {
@@ -606,7 +606,7 @@ async function handleAgentCommand(msg) {
         try {
           await chrome.tabs.update(targetId, { active: true });
           if (targetWinId) {
-            await chrome.windows.update(targetWinId, { focused: true, state: 'normal' });
+            await chrome.windows.update(targetWinId, { focused: true, state: 'normal', left: 20, top: 20, width: 1280, height: 760 });
           }
         } catch (e) {}
 
@@ -729,6 +729,78 @@ async function handleAgentCommand(msg) {
             }
             try { await chrome.debugger.detach(debugTarget); } catch (e) {}
             sendToAgent({ id: msg.id, result: { success: true, result: { clicked: !payload?.moveOnly, x: info.cx, y: info.cy, text: info.text } } });
+            return;
+          } catch (cdpErr) {
+            sendToAgent({ id: msg.id, result: { success: false, error: cdpErr.message } });
+            return;
+          }
+        }
+
+        if (action === 'CDP_CLEAR_AND_TYPE') {
+          try {
+            const rectRes = await chrome.scripting.executeScript({
+              target: { tabId: targetId },
+              world: 'MAIN',
+              func: (pl) => {
+                const { selector } = pl || {};
+                const clearBtn = document.querySelector("button[aria-label='清除提示']");
+                if (clearBtn && !clearBtn.disabled && clearBtn.getAttribute('aria-disabled') !== 'true') {
+                  clearBtn.click();
+                }
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
+                const candidates = Array.from(document.querySelectorAll(selector || 'flow-prompt-box .ProseMirror, .ProseMirror, [contenteditable="true"]')).filter(isVis);
+                const el = candidates.find(e => !e.closest('.agent-panel-wrapper')) || candidates[0];
+                if (!el) return { found: false };
+                el.focus();
+                const r = el.getBoundingClientRect();
+                return {
+                  found: true,
+                  cx: Math.round(r.left + r.width / 2),
+                  cy: Math.round(r.top + r.height / 2),
+                };
+              },
+              args: [payload],
+            });
+            const info = rectRes?.[0]?.result;
+            if (!info || !info.found) {
+              sendToAgent({ id: msg.id, result: { success: false, error: 'Target ProseMirror not found' } });
+              return;
+            }
+            const debugTarget = { tabId: targetId };
+            try { await chrome.debugger.attach(debugTarget, '1.3'); } catch (e) {}
+            // Click to ensure focus
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+              type: 'mousePressed', x: info.cx, y: info.cy, button: 'left', clickCount: 1
+            });
+            await sleep(35);
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+              type: 'mouseReleased', x: info.cx, y: info.cy, button: 'left', clickCount: 1
+            });
+            await sleep(150);
+            // Select all and delete (Ctrl+A + Backspace)
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+              type: 'rawKeyDown', windowsVirtualKeyCode: 65, code: 'KeyA', key: 'a', modifiers: 2
+            });
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+              type: 'keyUp', windowsVirtualKeyCode: 65, code: 'KeyA', key: 'a', modifiers: 2
+            });
+            await sleep(50);
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+              type: 'rawKeyDown', windowsVirtualKeyCode: 8, code: 'Backspace', key: 'Backspace'
+            });
+            await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+              type: 'keyUp', windowsVirtualKeyCode: 8, code: 'Backspace', key: 'Backspace'
+            });
+            await sleep(50);
+            // Insert text
+            if (payload?.text) {
+              await chrome.debugger.sendCommand(debugTarget, 'Input.insertText', { text: payload.text });
+            }
+            try { await chrome.debugger.detach(debugTarget); } catch (e) {}
+            sendToAgent({ id: msg.id, result: { success: true, textLength: payload?.text?.length || 0 } });
             return;
           } catch (cdpErr) {
             sendToAgent({ id: msg.id, result: { success: false, error: cdpErr.message } });
@@ -1033,7 +1105,9 @@ async function handleAgentCommand(msg) {
                 let target = null;
                 if (selector) {
                   const list = Array.from(document.querySelectorAll(selector)).filter(isVis);
-                  if (textMatch) {
+                  if (typeof pl?.index === 'number' && list[pl.index]) {
+                    target = list[pl.index];
+                  } else if (textMatch) {
                     target = list.find(el => ((el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch)) && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
                              list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
                   } else {
@@ -1134,6 +1208,201 @@ async function handleAgentCommand(msg) {
                     disabled: Boolean(target.disabled || target.getAttribute('aria-disabled') === 'true')
                   }
                 };
+              }
+              if (act === 'INSTALL_FETCH_HOOK') {
+                if (!window.__flowCapturedCalls) window.__flowCapturedCalls = [];
+                const applyOverride = (url, parsed) => {
+                  let newUrl = url;
+                  const ov = window.__flowNextOverride;
+                  if (ov && parsed && Array.isArray(parsed.requests) && parsed.requests.length > 0) {
+                    if (ov.type === 'IMAGE' && url.includes('batchGenerateImages')) {
+                      for (const req of parsed.requests) {
+                        if (ov.prompt) {
+                          req.structuredPrompt = { parts: [{ text: ov.prompt }] };
+                        }
+                        if (Array.isArray(ov.refIds) && ov.refIds.length > 0) {
+                          req.imageInputs = ov.refIds.map(id => ({
+                            name: id,
+                            imageInputType: 'IMAGE_INPUT_TYPE_REFERENCE'
+                          }));
+                        }
+                        if (ov.aspectRatio) {
+                          req.imageAspectRatio = ov.aspectRatio;
+                        }
+                        if (ov.modelName) {
+                          req.imageModelName = ov.modelName;
+                        }
+                        if (typeof ov.seed === 'number') {
+                          req.seed = ov.seed;
+                        }
+                      }
+                      if (ov.consume !== false) window.__flowNextOverride = null;
+                    } else if (ov.type === 'VIDEO' && url.includes('batchAsyncGenerateVideo')) {
+                      if (ov.targetEndpoint) {
+                        const keyMatch = url.match(/\?key=[^&]+/);
+                        const qs = keyMatch ? keyMatch[0] : '';
+                        newUrl = `https://aisandbox-pa.googleapis.com${ov.targetEndpoint}${qs}`;
+                      }
+                      for (const req of parsed.requests) {
+                        if (ov.prompt) {
+                          req.textInput = { structuredPrompt: { parts: [{ text: ov.prompt }] } };
+                        }
+                        if (ov.videoModelKey) {
+                          req.videoModelKey = ov.videoModelKey;
+                        }
+                        if (ov.aspectRatio) {
+                          req.aspectRatio = ov.aspectRatio;
+                        }
+                        if (typeof ov.seed === 'number') {
+                          req.seed = ov.seed;
+                        }
+                        if (ov.startImageId) {
+                          req.startImage = { mediaId: ov.startImageId };
+                        }
+                        if (ov.clearEndImage) {
+                          delete req.endImage;
+                        }
+                        if (Array.isArray(ov.referenceImageIds) && ov.referenceImageIds.length > 0) {
+                          req.referenceImages = ov.referenceImageIds.map(id => ({
+                            mediaId: id,
+                            imageUsageType: 'IMAGE_USAGE_TYPE_ASSET'
+                          }));
+                        }
+                      }
+                      if (ov.useV2ModelConfig !== undefined) {
+                        parsed.useV2ModelConfig = ov.useV2ModelConfig;
+                      }
+                      if (ov.consume !== false) window.__flowNextOverride = null;
+                    }
+                  }
+                  return { newUrl, bodyStr: JSON.stringify(parsed) };
+                };
+
+                if (!window.__flowFetchHooked) {
+                  const hookFetch = (origFn) => async function(input, init) {
+                    let url = typeof input === 'string' ? input : (input?.url || '');
+                    let options = init ? { ...init } : {};
+                    if (url.includes('aisandbox-pa.googleapis.com') && options.body && typeof options.body === 'string') {
+                      try {
+                        const parsed = JSON.parse(options.body);
+                        const patched = applyOverride(url, parsed);
+                        url = patched.newUrl;
+                        input = url;
+                        options.body = patched.bodyStr;
+                        const resp = await origFn.call(this, input, options);
+                        const clone = resp.clone();
+                        clone.text().then(txt => {
+                          window.__flowCapturedCalls.push({
+                            ts: Date.now(),
+                            via: 'fetch',
+                            url,
+                            status: resp.status,
+                            ok: resp.ok,
+                            reqSummary: patched.bodyStr.slice(0, 600),
+                            respText: txt.slice(0, 50000)
+                          });
+                        }).catch(() => {});
+                        return resp;
+                      } catch (e) {}
+                    }
+                    return origFn.call(this, input, init);
+                  };
+
+                  const origFetch = window.fetch.bind(window);
+                  window.fetch = hookFetch(origFetch);
+                  if (window.__zone_symbol__fetch) {
+                    const origZoneFetch = window.__zone_symbol__fetch.bind(window);
+                    window.__zone_symbol__fetch = hookFetch(origZoneFetch);
+                  }
+
+                  const origOpen = XMLHttpRequest.prototype.open;
+                  const origSend = XMLHttpRequest.prototype.send;
+                  const wrapOpen = (origOpenFn) => function(method, url, ...rest) {
+                    let targetUrl = String(url || '');
+                    const ov = window.__flowNextOverride;
+                    if (ov && ov.type === 'VIDEO' && ov.targetEndpoint && targetUrl.includes('batchAsyncGenerateVideo')) {
+                      const keyMatch = targetUrl.match(/\?key=[^&]+/);
+                      const qs = keyMatch ? keyMatch[0] : '';
+                      targetUrl = `https://aisandbox-pa.googleapis.com${ov.targetEndpoint}${qs}`;
+                    }
+                    this.__flowUrl = targetUrl;
+                    this.__flowMethod = method;
+                    return origOpenFn.call(this, method, targetUrl, ...rest);
+                  };
+                  XMLHttpRequest.prototype.open = wrapOpen(origOpen);
+                  if (XMLHttpRequest.prototype.__zone_symbol__open) {
+                    XMLHttpRequest.prototype.__zone_symbol__open = wrapOpen(XMLHttpRequest.prototype.__zone_symbol__open);
+                  }
+
+                  const wrapSend = (origSendFn) => function(body) {
+                    let bodyToSend = body;
+                    if (this.__flowUrl && this.__flowUrl.includes('aisandbox-pa.googleapis.com') && typeof body === 'string') {
+                      try {
+                        const parsed = JSON.parse(body);
+                        const patched = applyOverride(this.__flowUrl, parsed);
+                        bodyToSend = patched.bodyStr;
+                        const reqSum = bodyToSend.slice(0, 600);
+                        const u = this.__flowUrl;
+                        this.addEventListener('loadend', () => {
+                          try {
+                            window.__flowCapturedCalls.push({
+                              ts: Date.now(),
+                              via: 'xhr',
+                              url: u,
+                              status: this.status,
+                              ok: this.status >= 200 && this.status < 300,
+                              reqSummary: reqSum,
+                              respText: String(this.responseText || '').slice(0, 50000)
+                            });
+                          } catch (e) {}
+                        });
+                      } catch (e) {}
+                    }
+                    return origSendFn.call(this, bodyToSend);
+                  };
+                  XMLHttpRequest.prototype.send = wrapSend(origSend);
+                  if (XMLHttpRequest.prototype.__zone_symbol__send) {
+                    XMLHttpRequest.prototype.__zone_symbol__send = wrapSend(XMLHttpRequest.prototype.__zone_symbol__send);
+                  }
+                  window.__flowFetchHooked = true;
+                }
+                return { success: true, result: { hooked: true, count: window.__flowCapturedCalls.length } };
+              }
+              if (act === 'SET_NEXT_OVERRIDE') {
+                window.__flowNextOverride = pl || null;
+                return { success: true, result: { override: window.__flowNextOverride } };
+              }
+              if (act === 'GET_CAPTURED_CALLS') {
+                const calls = window.__flowCapturedCalls || [];
+                const resCalls = calls.slice();
+                if (pl && pl.clear) {
+                  window.__flowCapturedCalls = [];
+                }
+                return { success: true, result: { calls: resCalls, pendingOverride: window.__flowNextOverride || null } };
+              }
+              if (act === 'CLEAR_AND_TYPE') {
+                const { text } = pl || {};
+                const clearBtn = document.querySelector("button[aria-label='清除提示']");
+                if (clearBtn && !clearBtn.disabled) {
+                  clearBtn.click();
+                  await new Promise(r => setTimeout(r, 150));
+                }
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
+                const candidates = Array.from(document.querySelectorAll('flow-prompt-box .ProseMirror, .ProseMirror, [contenteditable="true"]')).filter(isVis);
+                const el = candidates.find(e => !e.closest('.agent-panel-wrapper')) || candidates[0];
+                if (!el) return { success: false, error: 'Visible ProseMirror not found' };
+                el.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                await new Promise(r => setTimeout(r, 100));
+                el.focus();
+                document.execCommand('insertText', false, text || '');
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text || '' }));
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                return { success: true, result: { typedLength: (el.innerText || '').length, preview: (el.innerText || '').slice(0, 80) } };
               }
               return { success: false, error: `Unknown action: ${act}` };
             } catch (err) {
@@ -1632,7 +1901,7 @@ async function ensureFlowProjectTab() {
   try {
     await chrome.tabs.update(targetTabId, { active: true });
     if (targetTab.windowId) {
-      await chrome.windows.update(targetTab.windowId, { focused: true, state: 'normal' });
+      await chrome.windows.update(targetTab.windowId, { focused: true, state: 'normal', left: 20, top: 20, width: 1280, height: 760 });
     }
     await sleep(300);
   } catch {}
@@ -2062,29 +2331,10 @@ async function handleApiRequest(msg) {
               const bodyToSend = payload ? JSON.parse(JSON.stringify(payload)) : payload;
               patchPayload(bodyToSend);
 
-              try {
-                const pageResp = await window.fetch(reqUrl, {
-                  method: reqMethod || 'POST',
-                  headers: reqHeaders,
-                  credentials: 'include',
-                  body: (reqMethod || 'POST') === 'GET' ? undefined : JSON.stringify(bodyToSend),
-                });
-                const pageText = await pageResp.text();
-                return {
-                  token,
-                  patchedBody: bodyToSend,
-                  inPageFetched: true,
-                  pageStatus: pageResp.status,
-                  pageOk: pageResp.ok,
-                  pageText,
-                };
-              } catch (fetchErr) {
-                return {
-                  token,
-                  patchedBody: bodyToSend,
-                  inPageFetched: false,
-                };
-              }
+              return {
+                token,
+                patchedBody: bodyToSend,
+              };
             } catch (err) {
               return { captchaError: err?.message || 'In-page script failed' };
             }
@@ -2094,9 +2344,6 @@ async function handleApiRequest(msg) {
             actionName: captchaAction || 'IMAGE_GENERATION',
             payload: finalBody,
             waitTimeoutMs: scriptTimeoutMs,
-            reqUrl: targetUrl,
-            reqMethod: method || 'POST',
-            reqHeaders: inPageHeaders,
           }],
         });
 
@@ -2120,24 +2367,18 @@ async function handleApiRequest(msg) {
         return;
       }
 
-      if (inPageResult.inPageFetched) {
-        responseStatus = inPageResult.pageStatus;
-        responseOk = inPageResult.pageOk;
-        responseText = inPageResult.pageText;
-      } else {
-        const fetchHeaders = { ...(headers || {}) };
-        fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+      const fetchHeaders = { ...(headers || {}) };
+      fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
 
-        const swResponse = await fetch(inPageResult.targetUrl || url, {
-          method: method || 'POST',
-          headers: fetchHeaders,
-          credentials: 'include',
-          body: (method || 'POST') === 'GET' ? undefined : JSON.stringify(inPageResult.patchedBody),
-        });
-        responseStatus = swResponse.status;
-        responseOk = swResponse.ok;
-        responseText = await swResponse.text();
-      }
+      const swResponse = await fetch(inPageResult.targetUrl || url, {
+        method: method || 'POST',
+        headers: fetchHeaders,
+        credentials: 'include',
+        body: (method || 'POST') === 'GET' ? undefined : JSON.stringify(inPageResult.patchedBody),
+      });
+      responseStatus = swResponse.status;
+      responseOk = swResponse.ok;
+      responseText = await swResponse.text();
     } else {
       const fetchHeaders = { ...(headers || {}) };
       fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
