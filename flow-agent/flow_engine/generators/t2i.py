@@ -89,28 +89,23 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
         req_item = {
             "clientContext": build_client_context(project_id),
             "seed": ((int(seed) + i) % 4294967296) if seed is not None else (ts + i * 1000) % 1000000,
-            "structuredPrompt": {"parts": [{"text": prompt}]},
-            "imageAspectRatio": aspect_ratio,
             "imageModelName": target_model,
-        }
-
-        # Add reference images if provided
-        if ref_media_ids:
-            req_item["imageInputs"] = [
+            "imageAspectRatio": aspect_ratio,
+            "structuredPrompt": {"parts": [{"text": prompt}]},
+            "imageInputs": [
                 {"name": mid, "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
                 for mid in ref_media_ids
-            ]
+            ] if ref_media_ids else [],
+        }
 
         requests.append(req_item)
 
     body = {
         "clientContext": build_client_context(project_id),
+        "mediaGenerationContext": build_generation_context(),
+        "useNewMedia": True,
         "requests": requests,
     }
-
-    if ref_media_ids:
-        body["mediaGenerationContext"] = build_generation_context()
-        body["useNewMedia"] = True
 
     # Endpoint: /v1/projects/{projectId}/flowMedia:batchGenerateImages
     endpoint = f"/v1/projects/{project_id}/flowMedia:batchGenerateImages"

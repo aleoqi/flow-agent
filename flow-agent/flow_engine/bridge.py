@@ -734,11 +734,25 @@ class ExtensionBridge:
             **(meta or {}),
         })
 
+        client_projects = {
+            "client-jhbh11": "bbdc5477-57f7-4953-89b3-7c3ddaa0546e",
+            "client-c3zrr3": "515751c4-c884-42a3-9561-5a1d7ddddcb4",
+        }
+        client_proj = client_projects.get(client_id)
+        if client_proj and "/projects/" in url_path:
+            import re as _re
+            url_path = _re.sub(
+                r"/projects/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/",
+                f"/projects/{client_proj}/",
+                url_path,
+                flags=_re.IGNORECASE,
+            )
+
         url = f"{API_BASE}{url_path}?key={API_KEY}"
         ua = random.choice(USER_AGENTS)
-        platform = '"macOS"' if "Macintosh" in ua else '"Windows"'
+        platform = '"Windows"'
 
-        # Ensure userPaygateTier matches the assigned client's account tier (Pro vs Freemium)
+        # Ensure userPaygateTier and projectId match the assigned client's account
         if isinstance(body, dict):
             import copy
             body = copy.deepcopy(body)
@@ -747,10 +761,14 @@ class ExtensionBridge:
 
             if "clientContext" in body and isinstance(body["clientContext"], dict):
                 body["clientContext"]["userPaygateTier"] = tier_val
+                if client_proj and body["clientContext"].get("projectId"):
+                    body["clientContext"]["projectId"] = client_proj
             if "requests" in body and isinstance(body["requests"], list):
                 for r in body["requests"]:
                     if isinstance(r, dict) and "clientContext" in r and isinstance(r["clientContext"], dict):
                         r["clientContext"]["userPaygateTier"] = tier_val
+                        if client_proj and r["clientContext"].get("projectId"):
+                            r["clientContext"]["projectId"] = client_proj
 
         msg = {
             "id": req_id,

@@ -112,6 +112,33 @@ async function init() {
       console.warn('[Flow Agent] Side Panel click behavior unavailable:', error.message);
     }
   }
+  try {
+    if (chrome.declarativeNetRequest?.updateEnabledRulesets) {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: ['referer_rules'] });
+    }
+    if (chrome.declarativeNetRequest?.updateDynamicRules) {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [1, 100],
+        addRules: [{
+          id: 100,
+          priority: 100,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [
+              { header: 'Origin', operation: 'set', value: 'https://labs.google' },
+              { header: 'Referer', operation: 'set', value: 'https://labs.google/' }
+            ]
+          },
+          condition: {
+            urlFilter: '*://aisandbox-pa.googleapis.com/*',
+            resourceTypes: ['xmlhttprequest', 'other']
+          }
+        }]
+      });
+    }
+  } catch (e) {
+    console.warn('[Flow Agent] DNR rule update warning:', e.message);
+  }
   await chrome.storage.local.remove('customServerIp');
   const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'callbackUrl', 'requestLog']);
   if (data.flowKey) flowKey = data.flowKey;
@@ -600,8 +627,23 @@ async function handleAgentCommand(msg) {
               if (act === 'GET_PERF_ENTRIES') {
                 const entries = performance.getEntriesByType('resource')
                   .map(r => r.name)
-                  .filter(u => u.includes('googleapis') || u.includes('/fx/') || u.includes('/api/'));
-                return { success: true, result: entries.slice(-30) };
+                  .filter(u => u.includes('googleapis') || u.includes('/fx/') || u.includes('/api/') || u.includes('flow-content') || u.includes('/asb/'));
+                return { success: true, result: entries.slice(-50) };
+              }
+              if (act === 'HOVER') {
+                const { selector } = pl;
+                const els = Array.from(document.querySelectorAll(selector || 'img.thumbnail'));
+                els.forEach(target => {
+                  let curr = target;
+                  for (let d = 0; d < 5 && curr; d++) {
+                    ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', ' pointermove', 'mousemove'].forEach(ev => {
+                      curr.dispatchEvent(new PointerEvent(ev.trim(), { bubbles: true, cancelable: true, composed: true }));
+                      curr.dispatchEvent(new MouseEvent(ev.trim(), { bubbles: true, cancelable: true, composed: true }));
+                    });
+                    curr = curr.parentElement;
+                  }
+                });
+                return { success: true, result: { hovered: els.length } };
               }
               if (act === 'GENERATE_VIDEO_NATIVE') {
                 const { prompt, aspect, duration, startImageId, endImageId, projectId, seed } = pl;
@@ -706,13 +748,27 @@ async function handleAgentCommand(msg) {
               }
               if (act === 'INPUT_TEXT') {
                 const { selector, text } = pl;
-                const el = document.querySelector(selector || 'textarea');
+                const el = document.querySelector(selector || '.ProseMirror, textarea, input');
                 if (!el) return { success: false, error: 'Input element not found' };
                 el.focus();
-                el.value = text;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                return { success: true, result: { value: el.value } };
+                if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(el);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  const ok = document.execCommand('insertText', false, text);
+                  if (!ok || !el.innerText?.includes(text.slice(0, 20))) {
+                    el.innerText = text;
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                  }
+                  return { success: true, result: { text: el.innerText?.slice(0, 100) } };
+                } else {
+                  el.value = text;
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  return { success: true, result: { value: el.value } };
+                }
               }
               return { success: false, error: `Unknown action: ${act}` };
             } catch (err) {
@@ -1174,7 +1230,7 @@ const RECAPTCHA_SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 
 let _captchaMutex = Promise.resolve();
 
-async function solveCaptcha(requestId, captchaAction) {
+async function _withCaptchaMutex(fn) {
   const currentMutex = _captchaMutex;
   let releaseMutex;
   _captchaMutex = new Promise(resolve => { releaseMutex = resolve; });
@@ -1184,64 +1240,97 @@ async function solveCaptcha(requestId, captchaAction) {
   } catch {}
 
   try {
-    return await _solveCaptchaInternal(requestId, captchaAction);
+    return await fn();
   } finally {
     await sleep(350); // Small cooldown gap between sequential captcha solves
     releaseMutex();
   }
 }
 
+async function ensureFlowProjectTab() {
+  const allTabs = await chrome.tabs.query({});
+  let targetTab = allTabs.slice().reverse().find(
+    t => t.url && (t.url.includes('flow.google.com/project/') || t.url.includes('labs.google/fx/tools/flow/project/'))
+  );
+  if (!targetTab) {
+    targetTab = allTabs.slice().reverse().find(
+      t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google/fx/tools/flow'))
+    );
+  }
+  if (!targetTab) {
+    targetTab = await chrome.tabs.create({ url: FLOW_URL, active: true });
+    await waitForTabComplete(targetTab.id, 15000);
+    await sleep(2000);
+  }
+
+  const targetTabId = targetTab.id;
+  try {
+    await chrome.tabs.update(targetTabId, { active: true });
+    if (targetTab.windowId) {
+      await chrome.windows.update(targetTab.windowId, { focused: true, state: 'normal' });
+    }
+    await sleep(300);
+  } catch {}
+
+  if (targetTab.discarded) {
+    await chrome.tabs.reload(targetTabId);
+    await waitForTabComplete(targetTabId, 15000);
+    await sleep(1500);
+  }
+
+  let currentTab = await chrome.tabs.get(targetTabId).catch(() => targetTab);
+  let currentUrl = currentTab?.url || '';
+
+  // If tab is on the root landing page (https://flow.google.com/) instead of a /project/<uuid> canvas,
+  // automatically enter the first existing project link on the landing page so enterprise.js loads.
+  if (!currentUrl.includes('/project/')) {
+    try {
+      const navResults = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        world: 'MAIN',
+        func: () => {
+          const link = document.querySelector('a[href*="/project/"]');
+          if (link && link.href) {
+            link.click();
+            return link.href;
+          }
+          return null;
+        },
+      });
+      const projectHref = navResults?.[0]?.result;
+      if (projectHref) {
+        await sleep(3500);
+        currentTab = await chrome.tabs.get(targetTabId).catch(() => currentTab);
+        currentUrl = currentTab?.url || '';
+        if (!currentUrl.includes('/project/')) {
+          await chrome.tabs.update(targetTabId, { url: projectHref, active: true });
+          await waitForTabComplete(targetTabId, 15000);
+          await sleep(2500);
+          currentTab = await chrome.tabs.get(targetTabId).catch(() => currentTab);
+          currentUrl = currentTab?.url || '';
+        }
+      }
+    } catch (e) {
+      console.warn('[Flow Agent] Auto-navigate to project canvas failed:', e.message);
+    }
+  }
+
+  const match = currentUrl.match(/\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  const projectId = match ? match[1] : null;
+  return { tabId: targetTabId, tabUrl: currentUrl, projectId };
+}
+
+async function solveCaptcha(requestId, captchaAction) {
+  return await _withCaptchaMutex(() => _solveCaptchaInternal(requestId, captchaAction));
+}
+
 async function _solveCaptchaInternal(requestId, captchaAction) {
-  let targetTabId = null;
-  let isTempTab = false;
   const scriptTimeoutMs = captchaAction === 'VIDEO_GENERATION' ? 30000 : 20000;
 
   try {
-    const allTabs = await chrome.tabs.query({});
-    // NOTE: 优先选取 labs.google/fx 页面以匹配 Origin: https://labs.google，次选 flow.google.com/project
-    let existingTab = allTabs.slice().reverse().find(t => t.url && t.url.includes('labs.google/fx') && !t.url.includes('labs.google/fx/tools/flow'));
-    if (!existingTab) {
-      existingTab = allTabs.slice().reverse().find(t => t.url && (t.url.includes('flow.google.com/project') || t.url.includes('labs.google/fx/tools/flow/project')));
-    }
-    if (!existingTab) {
-      existingTab = allTabs.slice().reverse().find(t => t.url && (t.url.includes('flow.google.com') || t.url.includes('labs.google')));
-    }
-    if (existingTab) {
-      targetTabId = existingTab.id;
-      try {
-        await chrome.tabs.update(targetTabId, { active: true });
-        if (existingTab.windowId) {
-          await chrome.windows.update(existingTab.windowId, { focused: true, state: 'normal' });
-        }
-        await sleep(500);
-      } catch {}
-      if (existingTab.discarded) {
-        await chrome.tabs.reload(targetTabId);
-        await waitForTabComplete(targetTabId);
-        await sleep(1500);
-      }
-    } else {
-      const newTab = await chrome.tabs.create({ url: FLOW_URL, active: true });
-      targetTabId = newTab.id;
-      isTempTab = true;
-      await waitForTabComplete(targetTabId);
-      await sleep(1500);
-    }
+    const { tabId: targetTabId } = await ensureFlowProjectTab();
 
-    // Attempt 1: Direct message to content.js -> injected.js in the page
-    try {
-      const tabResp = await Promise.race([
-        requestCaptchaFromTab(targetTabId, requestId, captchaAction),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('TAB_CAPTCHA_TIMEOUT')), 8000)),
-      ]);
-      if (tabResp && tabResp.token) {
-        return { token: tabResp.token };
-      }
-    } catch (e) {
-      console.warn('[Flow Agent] requestCaptchaFromTab error, trying fallback:', e.message);
-    }
-
-    // Attempt 2: Fallback to executeScript in MAIN world without violating TrustedScriptURL
+    // Execute directly in MAIN world (Attempt 1 via content.js removed due to TrustedTypes CSP)
     const results = await chrome.scripting.executeScript({
       target: { tabId: targetTabId },
       world: 'MAIN',
@@ -1255,62 +1344,48 @@ async function _solveCaptchaInternal(requestId, captchaAction) {
           };
           try {
             try {
+              window.focus();
+              window.dispatchEvent(new Event('focus'));
               Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
               Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
               document.hasFocus = () => true;
-              window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 200 }));
+              document.dispatchEvent(new MouseEvent('mousemove', {
+                bubbles: true,
+                clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
+                clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36)),
+              }));
             } catch (e) {}
 
             async function run() {
-              const exec = async (act) => {
-                const call = () => {
-                  if (window.grecaptcha?.enterprise?.execute) {
-                    return window.grecaptcha.enterprise.execute(siteKey, act ? { action: act } : undefined);
-                  }
-                  if (window.grecaptcha?.execute) {
-                    return window.grecaptcha.execute(siteKey, act ? { action: act } : undefined);
-                  }
-                  throw new Error('grecaptcha execute unavailable');
-                };
-                return await Promise.race([
-                  Promise.resolve().then(call),
-                  new Promise((_, rej) => setTimeout(() => rej(new Error('EXEC_TIMEOUT')), 5000))
-                ]);
-              };
-
               try {
-                const token = await exec(action);
-                if (token) return finish({ token });
-              } catch (err1) {
-                try {
-                  const token2 = await exec('IMAGE_GENERATION');
-                  if (token2) return finish({ token: token2 });
-                } catch (err2) {
-                  try {
-                    const token3 = await exec(null);
-                    if (token3) return finish({ token: token3 });
-                  } catch (err3) {
-                    if (window.grecaptcha?.enterprise?.ready) {
-                      window.grecaptcha.enterprise.ready(() => {
-                        exec(action || 'IMAGE_GENERATION')
-                          .then(tok => finish({ token: tok }))
-                          .catch(e => finish({ error: e?.message || 'reCAPTCHA execution failed' }));
-                      });
-                      return;
+                if (window.grecaptcha?.enterprise?.ready) {
+                  window.grecaptcha.enterprise.ready(async () => {
+                    try {
+                      const tok = await window.grecaptcha.enterprise.execute(siteKey, { action: action || 'IMAGE_GENERATION' });
+                      finish({ token: tok });
+                    } catch (e) {
+                      finish({ error: e?.message || 'reCAPTCHA execution failed' });
                     }
-                    finish({ error: err3?.message || err1?.message || 'reCAPTCHA execution failed' });
-                  }
+                  });
+                  return;
                 }
+                if (window.grecaptcha?.enterprise?.execute) {
+                  const tok = await window.grecaptcha.enterprise.execute(siteKey, { action: action || 'IMAGE_GENERATION' });
+                  return finish({ token: tok });
+                }
+                finish({ error: 'grecaptcha.enterprise.execute unavailable' });
+              } catch (err) {
+                finish({ error: err?.message || 'reCAPTCHA execution failed' });
               }
             }
 
-            if (typeof window.grecaptcha !== 'undefined' && (window.grecaptcha.enterprise || window.grecaptcha.execute)) {
+            if (typeof window.grecaptcha !== 'undefined' && window.grecaptcha?.enterprise?.execute) {
               run();
             } else {
               let waited = 0;
               const poll = setInterval(() => {
                 waited += 250;
-                if (typeof window.grecaptcha !== 'undefined' && (window.grecaptcha.enterprise || window.grecaptcha.execute)) {
+                if (typeof window.grecaptcha !== 'undefined' && window.grecaptcha?.enterprise?.execute) {
                   clearInterval(poll);
                   run();
                 } else if (waited >= timeoutMs) {
@@ -1320,7 +1395,7 @@ async function _solveCaptchaInternal(requestId, captchaAction) {
               }, 250);
             }
 
-            setTimeout(() => finish({ error: 'Timeout generating reCAPTCHA locally' }), timeoutMs);
+            setTimeout(() => finish({ error: 'Timeout generating reCAPTCHA locally' }), timeoutMs + 2000);
           } catch (e) {
             finish({ error: e.message });
           }
@@ -1336,10 +1411,6 @@ async function _solveCaptchaInternal(requestId, captchaAction) {
     return { error: res?.error || 'No token returned from page' };
   } catch (e) {
     return { error: e.message || 'Script execution failed' };
-  } finally {
-    if (isTempTab && targetTabId) {
-      chrome.tabs.remove(targetTabId).catch(() => {});
-    }
   }
 }
 
@@ -1482,59 +1553,10 @@ async function handleApiRequest(msg) {
   }
 
   try {
-    // Step 1: Solve captcha if needed
-    let captchaToken = null;
-    if (captchaAction) {
-      try {
-        const captchaResult = await solveCaptcha(id, captchaAction);
-        captchaToken = captchaResult?.token || null;
-        if (!captchaToken) {
-          const errDetail = captchaResult?.error || 'Failed to acquire reCAPTCHA token';
-          console.error(`[Flow Agent] Captcha error: ${errDetail}. Aborting request to prevent Google 403 / account flagging.`);
-          sendToAgent({
-            id,
-            status: 403,
-            error: `RECAPTCHA_FAILED: ${errDetail}. Ensure Chrome has an active flow.google.com tab visible.`,
-          });
-          if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `RECAPTCHA_FAILED: ${errDetail}`; }
-          chrome.storage.local.set({ metrics });
-          updateRequestLog(logId, { status: 'failed', error: `RECAPTCHA_FAILED: ${errDetail}` });
-          setState('idle');
-          return;
-        }
-      } catch (err) {
-        console.error('[Flow Agent] Captcha solver exception, aborting request:', err.message);
-        sendToAgent({
-          id,
-          status: 403,
-          error: `RECAPTCHA_EXCEPTION: ${err.message}`,
-        });
-        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `RECAPTCHA_EXCEPTION: ${err.message}`; }
-        chrome.storage.local.set({ metrics });
-        updateRequestLog(logId, { status: 'failed', error: `RECAPTCHA_EXCEPTION: ${err.message}` });
-        setState('idle');
-        return;
-      }
+    let activeFlowKey = flowKey;
+    if (!activeFlowKey) {
+      activeFlowKey = await fetchTokenFromSession();
     }
-
-    // Step 2: Inject captcha token into body
-    let finalBody = body;
-    if (captchaToken && finalBody) {
-      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
-      if (finalBody.clientContext?.recaptchaContext) {
-        finalBody.clientContext.recaptchaContext.token = captchaToken;
-      }
-      if (finalBody.requests && Array.isArray(finalBody.requests)) {
-        for (const req of finalBody.requests) {
-          if (req.clientContext?.recaptchaContext) {
-            req.clientContext.recaptchaContext.token = captchaToken;
-          }
-        }
-      }
-    }
-
-    // Step 3: Use flowKey for auth
-    const activeFlowKey = flowKey;
     if (!activeFlowKey) {
       sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
@@ -1544,30 +1566,201 @@ async function handleApiRequest(msg) {
       return;
     }
 
-    const fetchHeaders = { ...(headers || {}) };
-    fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+    let responseStatus = 0;
+    let responseOk = false;
+    let responseText = '';
+    let responseData = null;
 
-    // Step 4: Make the API call from browser context
-    const response = await fetch(url, {
-      method: method || 'POST',
-      headers: fetchHeaders,
-      credentials: 'include',
-      body: method === 'GET' ? undefined : JSON.stringify(finalBody),
-    });
+    if (hasCaptcha) {
+      const scriptTimeoutMs = captchaAction === 'VIDEO_GENERATION' ? 30000 : 20000;
+      const inPageResult = await _withCaptchaMutex(async () => {
+        const { tabId: targetTabId, projectId: tabProjectId } = await ensureFlowProjectTab();
 
-    let responseData;
-    const responseText = await response.text();
+        let targetUrl = url;
+        let finalBody = body ? JSON.parse(JSON.stringify(body)) : body;
+
+        // Align projectId in URL and body with the client's open project canvas tab
+        if (tabProjectId) {
+          targetUrl = targetUrl.replace(
+            /\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\//i,
+            `/projects/${tabProjectId}/`
+          );
+          if (finalBody && typeof finalBody === 'object') {
+            if (finalBody.clientContext && typeof finalBody.clientContext === 'object' && finalBody.clientContext.projectId) {
+              finalBody.clientContext.projectId = tabProjectId;
+            }
+            if (Array.isArray(finalBody.requests)) {
+              for (const req of finalBody.requests) {
+                if (req && req.clientContext && typeof req.clientContext === 'object' && req.clientContext.projectId) {
+                  req.clientContext.projectId = tabProjectId;
+                }
+              }
+            }
+          }
+        }
+
+        const evalResults = await chrome.scripting.executeScript({
+          target: { tabId: targetTabId },
+          world: 'MAIN',
+          func: async ({ websiteKey, actionName, payload, waitTimeoutMs }) => {
+            try {
+              try {
+                window.focus();
+                window.dispatchEvent(new Event('focus'));
+                Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+                Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+                document.hasFocus = () => true;
+                document.dispatchEvent(new MouseEvent('mousemove', {
+                  bubbles: true,
+                  clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
+                  clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36)),
+                }));
+              } catch (e) {}
+
+              const waitForEnterprise = () => new Promise((resolve) => {
+                if (typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha?.enterprise?.execute === 'function') {
+                  return resolve(true);
+                }
+                let waited = 0;
+                const timer = setInterval(() => {
+                  waited += 250;
+                  if (typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha?.enterprise?.execute === 'function') {
+                    clearInterval(timer);
+                    resolve(true);
+                  } else if (waited >= waitTimeoutMs) {
+                    clearInterval(timer);
+                    resolve(false);
+                  }
+                }, 250);
+              });
+
+              const ready = await waitForEnterprise();
+              if (!ready) {
+                return { captchaError: 'Timeout waiting for grecaptcha in page' };
+              }
+
+              const solveToken = () => new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('captcha_timeout')), 25000);
+                try {
+                  window.grecaptcha.enterprise.execute(websiteKey, { action: actionName })
+                    .then((tok) => {
+                      clearTimeout(timer);
+                      resolve(tok);
+                    })
+                    .catch((err) => {
+                      clearTimeout(timer);
+                      reject(err);
+                    });
+                } catch (err) {
+                  clearTimeout(timer);
+                  reject(err);
+                }
+              });
+
+              let token;
+              try {
+                token = await solveToken();
+              } catch (err) {
+                return { captchaError: err?.message || 'reCAPTCHA execution failed' };
+              }
+              if (!token) {
+                return { captchaError: 'Empty reCAPTCHA token returned' };
+              }
+
+              const sessionId = `;${Date.now()}`;
+              const patchPayload = (value) => {
+                if (!value) return;
+                if (Array.isArray(value)) {
+                  value.forEach(patchPayload);
+                  return;
+                }
+                if (typeof value !== 'object') return;
+                if (value.sessionId && typeof value.sessionId === 'string') {
+                  value.sessionId = sessionId;
+                }
+                if (value.recaptchaContext && typeof value.recaptchaContext === 'object') {
+                  value.recaptchaContext.token = token;
+                  if (!value.recaptchaContext.applicationType) {
+                    value.recaptchaContext.applicationType = 'RECAPTCHA_APPLICATION_TYPE_WEB';
+                  }
+                }
+                Object.values(value).forEach(patchPayload);
+              };
+
+              const bodyToSend = payload ? JSON.parse(JSON.stringify(payload)) : payload;
+              patchPayload(bodyToSend);
+
+              return {
+                token,
+                patchedBody: bodyToSend,
+              };
+            } catch (err) {
+              return { captchaError: err?.message || 'In-page script failed' };
+            }
+          },
+          args: [{
+            websiteKey: RECAPTCHA_SITE_KEY,
+            actionName: captchaAction || 'IMAGE_GENERATION',
+            payload: finalBody,
+            waitTimeoutMs: scriptTimeoutMs,
+          }],
+        });
+
+        const res = evalResults?.[0]?.result || { captchaError: 'Empty executeScript result' };
+        return { ...res, targetUrl };
+      });
+
+      if (inPageResult.captchaError) {
+        const errDetail = inPageResult.captchaError;
+        console.error(`[Flow Agent] Captcha error: ${errDetail}. Aborting request.`);
+        sendToAgent({
+          id,
+          status: 403,
+          error: `RECAPTCHA_FAILED: ${errDetail}. Ensure Chrome has an active flow.google.com tab visible.`,
+        });
+        metrics.failedCount++;
+        metrics.lastError = `RECAPTCHA_FAILED: ${errDetail}`;
+        chrome.storage.local.set({ metrics });
+        updateRequestLog(logId, { status: 'failed', error: `RECAPTCHA_FAILED: ${errDetail}` });
+        setState('idle');
+        return;
+      }
+
+      const fetchHeaders = { ...(headers || {}) };
+      fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+
+      const swResponse = await fetch(inPageResult.targetUrl || url, {
+        method: method || 'POST',
+        headers: fetchHeaders,
+        credentials: 'include',
+        body: (method || 'POST') === 'GET' ? undefined : JSON.stringify(inPageResult.patchedBody),
+      });
+      responseStatus = swResponse.status;
+      responseOk = swResponse.ok;
+      responseText = await swResponse.text();
+    } else {
+      const fetchHeaders = { ...(headers || {}) };
+      fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+
+      const response = await fetch(url, {
+        method: method || 'POST',
+        headers: fetchHeaders,
+        credentials: 'include',
+        body: method === 'GET' ? undefined : JSON.stringify(body),
+      });
+      responseStatus = response.status;
+      responseOk = response.ok;
+      responseText = await response.text();
+    }
+
     try {
       responseData = JSON.parse(responseText);
     } catch {
       responseData = responseText;
     }
 
-    // Self-heal: a 401 means Google invalidated our cached token (usually via
-    // inactivity, before our 50-min freshness window). Drop it so the very next
-    // request / refresh forces a genuine tab reload + re-capture instead of
-    // resending the same dead token.
-    if (response.status === 401) {
+    // Self-heal: a 401 means Google invalidated our cached token
+    if (responseStatus === 401) {
       console.warn('[Flow Agent] 401 UNAUTHENTICATED on request: dropping dead token and initiating session refresh');
       flowKey = null;
       metrics.tokenCapturedAt = null;
@@ -1583,17 +1776,17 @@ async function handleApiRequest(msg) {
 
     sendToAgent({
       id,
-      status: response.status,
+      status: responseStatus,
       data: responseData,
     });
 
     const responseSummary = responseText ? responseText.slice(0, 300) : null;
-    if (response.ok) {
+    if (responseOk) {
       if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
-      updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary });
+      updateRequestLog(logId, { status: 'success', httpStatus: responseStatus, responseSummary });
     } else {
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
-      updateRequestLog(logId, { status: 'failed', error: `API_${response.status}`, httpStatus: response.status, responseSummary });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${responseStatus}`; }
+      updateRequestLog(logId, { status: 'failed', error: `API_${responseStatus}`, httpStatus: responseStatus, responseSummary });
     }
   } catch (e) {
     sendToAgent({

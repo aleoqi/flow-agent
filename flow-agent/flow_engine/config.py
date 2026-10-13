@@ -101,7 +101,7 @@ API_BASE = "https://aisandbox-pa.googleapis.com"
 CLIENT_CTX = {
     "tool": "PINHOLE",
     "tier": "PAYGATE_TIER_ONE",
-    "origin": "https://labs.google",
+    "origin": "https://flow.google.com",
     "recaptcha_app_type": "RECAPTCHA_APPLICATION_TYPE_WEB",
 }
 
@@ -194,6 +194,5 @@ SEGMENT_DURATION = 10
 FPS = 24
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
 ]
