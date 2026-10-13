@@ -34,6 +34,7 @@ class VideoGenerationRequest(BaseModel):
     n: int = Field(1, ge=1, le=20, description="Number of videos to generate (1-20)")
     duration: int = Field(8, description="Duration in seconds (e.g. 4, 6, 8, 10)")
     image_base64: Optional[str] = Field(None, description="Optional base64 start image for image-to-video")
+    end_image_base64: Optional[str] = Field(None, description="Optional base64 end image for first-last frame video generation")
     ref_media_ids: Optional[List[str]] = Field(None, description="Optional reference image media IDs (up to 10)")
     start_media_id: Optional[str] = Field(None, description="Optional pre-uploaded start image or video media ID")
     end_media_id: Optional[str] = Field(None, description="Optional pre-uploaded end image media ID (requires start_media_id or image_base64)")

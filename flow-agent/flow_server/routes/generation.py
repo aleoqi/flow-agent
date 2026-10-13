@@ -896,6 +896,35 @@ async def _generate_video(req: VideoGenerationRequest, x_client_id: Optional[str
                 os.remove(temp_img_path)
             raise HTTPException(status_code=500, detail=f"Asset upload error: {str(e)}")
 
+    temp_end_img_path = None
+    if getattr(req, "end_image_base64", None) and not end_media_id:
+        media_bytes, mime_type = _decode_base64_media(req.end_image_base64)
+        if not mime_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"End asset must be an image; received {mime_type}.",
+            )
+        timestamp = int(time.time())
+        extension = extension_for_media(media_bytes, declared_mime=mime_type)
+        temp_end_name = f"fl_end_upload_{timestamp}_{uuid.uuid4().hex[:6]}{extension}"
+        temp_end_img_path = os.path.join(OUTPUT_DIR, temp_end_name)
+        try:
+            with open(temp_end_img_path, "wb") as f:
+                f.write(media_bytes)
+            from flow_engine.generators.i2v import upload_image
+            end_media_id = await upload_image(active_bridge, temp_end_img_path, project_id)
+            if not end_media_id:
+                raise HTTPException(status_code=500, detail="Failed to upload end image to Google Flow.")
+        except Exception as e:
+            log.exception("Error uploading end asset")
+            raise HTTPException(status_code=500, detail=f"End asset upload error: {str(e)}")
+        finally:
+            if temp_end_img_path and os.path.exists(temp_end_img_path):
+                try:
+                    os.remove(temp_end_img_path)
+                except OSError:
+                    pass
+
     if end_media_id and not image_media_id:
         if temp_img_path and os.path.exists(temp_img_path):
             os.remove(temp_img_path)

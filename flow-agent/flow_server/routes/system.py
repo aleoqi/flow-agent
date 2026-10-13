@@ -284,9 +284,82 @@ async def eval_tab(body: dict = Body(...), x_client_id: Optional[str] = Header(N
         bridge._pending.pop(req_id, None)
 
 
+@router.post("/v1/canvas/agent", dependencies=[Depends(verify_api_key)])
+async def canvas_agent_endpoint(
+    body: dict = Body(...),
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Interact with Google Flow's native Canvas Agent (`button.agent-mode-chip`)."""
+    active_bridge = await get_active_bridge()
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="'prompt' is required and cannot be empty")
+    wait_seconds = int(body.get("wait_seconds", 45))
+    auto_reset_mode = bool(body.get("auto_reset_mode", True))
+    client_id = x_client_id or body.get("client_id") or None
+    from flow_engine.canvas_driver import canvas_invoke_agent
+    try:
+        res = await canvas_invoke_agent(
+            active_bridge,
+            prompt=prompt,
+            wait_seconds=wait_seconds,
+            auto_reset_mode=auto_reset_mode,
+            client_id=client_id,
+        )
+        return res
+    except Exception as e:
+        log.exception("Canvas Agent invocation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/v1/canvas/extract-media", dependencies=[Depends(verify_api_key)])
+async def canvas_extract_media_endpoint(
+    body: Optional[dict] = Body(default=None),
+    x_client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Extract current video and image signed URLs from the Flow Canvas DOM."""
+    active_bridge = await get_active_bridge()
+    payload = body or {}
+    client_id = x_client_id or payload.get("client_id") or None
+    from flow_engine.canvas_driver import canvas_extract_media
+    try:
+        res = await canvas_extract_media(active_bridge, client_id=client_id)
+        return res
+    except Exception as e:
+        log.exception("Canvas media extraction failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/v1/system/status")
+async def system_status():
+    """Return detailed system and connected client status."""
+    bridge = state.get_bridge()
+    if not bridge:
+        return {"status": "starting", "version": "2.1.0", "connected": False, "clients": []}
+    clients = [
+        {
+            "client_id": cid,
+            "state": bridge._states.get(cid, "idle"),
+            "has_token": bool(bridge._tokens.get(cid)),
+            "tier": bridge._tiers.get(cid),
+            "credits": bridge._credits.get(cid),
+        }
+        for cid in bridge._clients
+    ]
+    return {
+        "status": "healthy" if await bridge.health_check() else "unauthorized_or_disconnected",
+        "version": "2.1.0",
+        "extension_connected": bridge.is_extension_connected(),
+        "has_flow_key": bridge.has_flow_key(),
+        "transport": bridge.active_transport(),
+        "client_count": len(clients),
+        "clients": clients,
+    }
+
+
 @router.get("/")
 async def root():
-    return {"status": "running", "service": "Flow Agent API"}
+    return {"status": "running", "service": "Flow Agent API", "version": "2.1.0"}
 
 
 # Health Check
@@ -294,9 +367,10 @@ async def root():
 async def health():
     bridge = state.get_bridge()
     if not bridge:
-        return {"status": "starting", "connected": False, "transport": "none"}
+        return {"status": "starting", "connected": False, "transport": "none", "version": "2.1.0"}
     return {
         "status": "healthy" if await bridge.health_check() else "unauthorized_or_disconnected",
+        "version": "2.1.0",
         "extension_connected": bridge.is_extension_connected(),
         "has_flow_key": bridge.has_flow_key(),
         "transport": bridge.active_transport(),

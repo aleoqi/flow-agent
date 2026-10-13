@@ -163,6 +163,22 @@ async def execute_mcp_tool(request_id, tool_name, arguments):
                 except Exception as e:
                     return _mcp_error(request_id, -32602, f"Error reading starting image: {str(e)}")
 
+            end_media_id = None if is_edit else arguments.get("end_media_id")
+            end_image_b64 = None
+            end_image_path = None if is_edit else arguments.get("end_image_path")
+            if end_image_path and not end_media_id:
+                if not os.path.exists(end_image_path):
+                    return _mcp_error(request_id, -32602,
+                                      f"Error: End image path does not exist: {end_image_path}")
+                try:
+                    end_media_id = await _mcp_upload_local_file(end_image_path)
+                except Exception:
+                    try:
+                        with open(end_image_path, "rb") as f:
+                            end_image_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    except Exception as e:
+                        return _mcp_error(request_id, -32602, f"Error reading end image: {str(e)}")
+
             try:
                 duration = int(arguments.get("duration") or 8)
             except (TypeError, ValueError):
@@ -172,15 +188,20 @@ async def execute_mcp_tool(request_id, tool_name, arguments):
             except (TypeError, ValueError):
                 count = 1
 
+            seed_val = arguments.get("seed")
             req = VideoGenerationRequest(
                 prompt=prompt,
                 aspect=arguments.get("aspect", "landscape"),
                 n=count,
                 duration=duration,
                 image_base64=start_image_b64,
+                end_image_base64=end_image_b64,
                 start_media_id=start_media_id,
+                end_media_id=end_media_id,
                 ref_media_ids=(list(arguments.get("ref_media_ids") or [])[:10] or None),
                 is_video=is_edit,
+                seed=int(seed_val) if seed_val is not None else None,
+                video_model=arguments.get("video_model"),
                 resolution=arguments.get("resolution"),
             )
 
@@ -297,6 +318,25 @@ async def execute_mcp_tool(request_id, tool_name, arguments):
                 except Exception as e:
                     result["flow_upload"] = {"error": str(e)}
             text = json.dumps(result, indent=2)
+
+        elif tool_name == "invoke_flow_canvas_agent":
+            prompt = str(arguments.get("prompt") or "").strip()
+            if not prompt:
+                return _mcp_error(request_id, -32602, "Error: 'prompt' is required and cannot be empty.")
+            wait_seconds = int(arguments.get("wait_seconds") or 45)
+            auto_reset_mode = bool(arguments.get("auto_reset_mode", True))
+            client_id = str(arguments.get("client_id") or "").strip() or None
+            from flow_server.state import get_active_bridge
+            from flow_engine.canvas_driver import canvas_invoke_agent
+            active_bridge = await get_active_bridge()
+            res = await canvas_invoke_agent(
+                active_bridge,
+                prompt=prompt,
+                wait_seconds=wait_seconds,
+                auto_reset_mode=auto_reset_mode,
+                client_id=client_id,
+            )
+            text = json.dumps(res, ensure_ascii=False, indent=2)
 
         else:
             return _mcp_error(request_id, -32601, f"Unknown tool: {tool_name}")

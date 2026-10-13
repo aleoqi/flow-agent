@@ -161,7 +161,7 @@ def handle_initialize(request_id, params=None):
             },
             "serverInfo": {
                 "name": "flow-agent",
-                "version": "2.0.7"
+                "version": "2.1.0"
             }
         }
     }
@@ -438,6 +438,37 @@ def handle_tools_list(request_id):
                     "aspect": {"type": "string", "enum": ["landscape", "portrait"], "default": "landscape"},
                     "duration": {"type": "integer", "enum": [4, 6, 8, 10], "default": 8},
                     "ref_media_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 10}
+                },
+                "required": ["prompt"]
+            }
+        },
+        {
+            "name": "invoke_flow_canvas_agent",
+            "description": "Interact with Google Flow's native Canvas Agent (button.agent-mode-chip) for storyboarding, prompt ideation, or multi-turn canvas assistance.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Instruction or question to send to the Flow Canvas Agent"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "maximum": 300,
+                        "default": 45,
+                        "description": "Seconds to poll for new agent text/media responses on the canvas (default: 45)"
+                    },
+                    "auto_reset_mode": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Automatically toggle off Agent mode after receiving the response so normal generation stays ready"
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "default": "",
+                        "description": "Optional specific Chrome extension client ID (e.g. client-jhbh11 or client-c3zrr3)"
+                    }
                 },
                 "required": ["prompt"]
             }
@@ -1171,6 +1202,23 @@ def handle_tool_call(request_id, tool_name, arguments):
             arguments.get("ref_media_ids"),
         )
         content = [{"type": "text", "text": text}]
+    elif tool_name == "invoke_flow_canvas_agent":
+        prompt = str(arguments.get("prompt") or "").strip()
+        wait_seconds = int(arguments.get("wait_seconds") or 45)
+        auto_reset_mode = bool(arguments.get("auto_reset_mode", True))
+        client_id = str(arguments.get("client_id") or "").strip()
+        payload = {
+            "prompt": prompt,
+            "wait_seconds": wait_seconds,
+            "auto_reset_mode": auto_reset_mode,
+        }
+        if client_id:
+            payload["client_id"] = client_id
+        try:
+            res = _request_json("/v1/canvas/agent", payload, timeout=max(60, wait_seconds + 35))
+            content = [{"type": "text", "text": json.dumps(res, ensure_ascii=False, indent=2)}]
+        except Exception as e:
+            content = [{"type": "text", "text": f"Error invoking Flow Canvas Agent: {str(e)}"}]
     else:
         return {
             "jsonrpc": "2.0",

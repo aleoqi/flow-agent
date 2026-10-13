@@ -719,10 +719,111 @@ async function handleAgentCommand(msg) {
                 const { selector } = pl;
                 const els = Array.from(document.querySelectorAll(selector)).map(el => ({
                   text: el.innerText?.trim(),
-                  html: el.outerHTML?.slice(0, 300),
-                  ariaLabel: el.getAttribute('aria-label')
+                  html: el.outerHTML?.slice(0, 1200),
+                  ariaLabel: el.getAttribute('aria-label'),
+                  ariaPressed: el.getAttribute('aria-pressed'),
+                  src: el.getAttribute('src') || el.currentSrc || '',
+                  alt: el.getAttribute('alt') || '',
+                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true')
                 }));
                 return { success: true, result: els };
+              }
+              if (act === 'EXTRACT_MEDIA_URLS') {
+                const hoverTargets = Array.from(document.querySelectorAll('img.thumbnail, [class*="card"], [class*="media"]'));
+                hoverTargets.forEach(target => {
+                  let curr = target;
+                  for (let d = 0; d < 5 && curr; d++) {
+                    ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'mousemove'].forEach(ev => {
+                      curr.dispatchEvent(new PointerEvent(ev, { bubbles: true, cancelable: true, composed: true }));
+                      curr.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true }));
+                    });
+                    curr = curr.parentElement;
+                  }
+                });
+                await new Promise(r => setTimeout(r, 600));
+                const videos = Array.from(document.querySelectorAll('video'))
+                  .map(v => (v.getAttribute('src') || v.currentSrc || '').replace(/&amp;/g, '&'))
+                  .filter(Boolean);
+                const images = Array.from(document.querySelectorAll('img.thumbnail')).map(img => ({
+                  src: (img.getAttribute('src') || img.currentSrc || '').replace(/&amp;/g, '&'),
+                  alt: img.getAttribute('alt') || ''
+                }));
+                const perfUrls = performance.getEntriesByType('resource')
+                  .map(r => r.name)
+                  .filter(u => u.includes('flow-content.google') || u.includes('/asb/'))
+                  .slice(-50);
+                return { success: true, result: { videos, images, perfUrls } };
+              }
+              if (act === 'SET_AGENT_MODE') {
+                const enabled = Boolean(pl?.enabled ?? false);
+                const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                const btn = document.querySelector('button.agent-mode-chip') ||
+                  allBtns.find(b => {
+                    const t = (b.innerText || '').trim();
+                    const a = (b.getAttribute('aria-label') || '').trim();
+                    return t === '智能体' || t === 'Agent' || a === '智能体' || a === 'Agent';
+                  });
+                if (!btn) {
+                  return { success: true, result: { found: false } };
+                }
+                const prevPressed = btn.getAttribute('aria-pressed') === 'true';
+                if (prevPressed !== enabled) {
+                  btn.click();
+                }
+                return { success: true, result: { found: true, enabled, prevPressed } };
+              }
+              if (act === 'AGENT_INTERACT') {
+                const prompt = String(pl?.prompt || '');
+                const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                const chip = document.querySelector('button.agent-mode-chip') ||
+                  allBtns.find(b => (b.innerText || '').includes('智能体') || (b.getAttribute('aria-label') || '').includes('智能体') || (b.innerText || '').trim() === 'Agent');
+                if (chip && chip.getAttribute('aria-pressed') !== 'true') {
+                  chip.click();
+                  await new Promise(r => setTimeout(r, 500));
+                }
+                const el = document.querySelector('.ProseMirror, textarea, input[type="text"]');
+                if (!el) return { success: false, error: 'Input element not found' };
+                el.focus();
+                if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(el);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  const ok = document.execCommand('insertText', false, prompt);
+                  if (!ok || !el.innerText?.includes(prompt.slice(0, 20))) {
+                    el.innerText = prompt;
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+                  }
+                } else {
+                  el.value = prompt;
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                await new Promise(r => setTimeout(r, 500));
+                let submitBtn = document.querySelector('button[aria-label="开始生成"], button[aria-label="发送"], button[aria-label*="Send"], button[aria-label*="Submit"]');
+                if (!submitBtn) {
+                  let container = el.parentElement;
+                  for (let i = 0; i < 6 && container; i++) {
+                    const candidateBtns = Array.from(container.querySelectorAll('button')).filter(b => {
+                      if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+                      if (b.classList.contains('agent-mode-chip')) return false;
+                      const label = (b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '');
+                      if (label.includes('设置触发器') || label.includes('智能体') || label.includes('添加') || label.includes('Add') || label.includes('开始') && label.trim() === '开始' || label.trim() === '结束') return false;
+                      return true;
+                    });
+                    if (candidateBtns.length > 0) {
+                      submitBtn = candidateBtns[candidateBtns.length - 1];
+                      break;
+                    }
+                    container = container.parentElement;
+                  }
+                }
+                if (submitBtn) {
+                  submitBtn.click();
+                  return { success: true, result: { submitted: true, agentChipFound: Boolean(chip), promptLength: prompt.length } };
+                }
+                return { success: false, error: 'Submit button not found', result: { submitted: false, agentChipFound: Boolean(chip), promptLength: prompt.length } };
               }
               if (act === 'CLICK') {
                 const { selector, textMatch } = pl;

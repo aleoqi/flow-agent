@@ -83,6 +83,19 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
     aspect_ratio = IMAGE_ASPECTS.get(aspect, aspect)
     target_model = IMAGE_MODELS.get((model or "").lower(), DEFAULT_IMAGE_MODEL)
 
+    if os.environ.get("FLOW_FORCE_CANVAS_UI") == "1":
+        from ..canvas_driver import canvas_generate_image
+        log.warning("FLOW_FORCE_CANVAS_UI=1 set — routing image generation directly to Track 2 Canvas UI")
+        fb_data = await canvas_generate_image(
+            bridge, prompt=prompt, aspect=aspect, count=count, project_id=project_id
+        )
+        fb_results = _parse_image_results(fb_data)
+        for r in fb_results:
+            r["_model"] = target_model
+            r["_client_id"] = fb_data.get("_client_id", "")
+            r["_track"] = "canvas_ui_fallback"
+        return fb_results or None
+
     # Build N items in requests array (1 API call = N images)
     requests = []
     for i in range(count):
@@ -141,6 +154,24 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
                     break
             err = err.get("error", {}).get("message", result.get("error", "Unknown"))
         err_msg = f"{err}{reason}"
+        upper_err = err_msg.upper()
+        if status == 403 or any(k in upper_err for k in ("PUBLIC_ERROR_UNUSUAL_ACTIVITY", "UNUSUAL_ACTIVITY", "RECAPTCHA", "403")):
+            from ..canvas_driver import canvas_generate_image
+            log.warning(
+                "Track 1 REST T2I failed (%s: %s) — falling back to Track 2 Canvas UI!",
+                status, err_msg,
+            )
+            fb_data = await canvas_generate_image(
+                bridge, prompt=prompt, aspect=aspect, count=count, project_id=project_id,
+                client_id=client_id or None,
+            )
+            fb_results = _parse_image_results(fb_data)
+            for r in fb_results:
+                r["_model"] = target_model
+                r["_client_id"] = fb_data.get("_client_id", client_id)
+                r["_track"] = "canvas_ui_fallback"
+            if fb_results:
+                return fb_results
         log.error("Failed (%s): %s", status, err_msg)
         raise ValueError(err_msg)
 

@@ -1,6 +1,7 @@
 """Flow Engine — Text to Video (T2V) generator."""
 
 import logging
+import os
 import random
 
 from ..config import ENDPOINTS
@@ -13,11 +14,20 @@ async def generate_video(bridge, prompt: str, aspect: str, project_id: str,
                          duration: int = 10, count: int = 1,
                          seed: int = None, video_model: str = None) -> list[str] | None:
     """Submit T2V generation request. Returns list of media_ids."""
+    if os.environ.get("FLOW_FORCE_CANVAS_UI") == "1":
+        from ..canvas_driver import canvas_generate_video
+        log.warning("FLOW_FORCE_CANVAS_UI=1 set — routing T2V directly to Track 2 Canvas UI")
+        fb = await canvas_generate_video(
+            bridge, prompt=prompt, aspect=aspect, duration=duration, project_id=project_id
+        )
+        return [m.get("name") for m in fb.get("media", []) if m.get("name")] or None
+
     model_key = video_model or f"abra_t2v_{duration}s"
 
     requests = []
     for i in range(count):
         requests.append({
+            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,
@@ -47,6 +57,17 @@ async def generate_video(bridge, prompt: str, aspect: str, project_id: str,
                     break
             err = err.get("error", {}).get("message", result.get("error", "Unknown"))
         err_msg = f"{err}{reason}"
+        upper_err = err_msg.upper()
+        if status == 403 or any(k in upper_err for k in ("PUBLIC_ERROR_UNUSUAL_ACTIVITY", "UNUSUAL_ACTIVITY", "RECAPTCHA", "403")):
+            from ..canvas_driver import canvas_generate_video
+            log.warning("Track 1 REST T2V failed (%s: %s) — falling back to Track 2 Canvas UI!", status, err_msg)
+            fb = await canvas_generate_video(
+                bridge, prompt=prompt, aspect=aspect, duration=duration, project_id=project_id,
+                client_id=result.get("_client_id") if isinstance(result, dict) else None,
+            )
+            media_ids = [m.get("name") for m in fb.get("media", []) if m.get("name")]
+            if media_ids:
+                return media_ids
         log.error("Failed (%s): %s", status, err_msg)
         raise ValueError(err_msg)
 

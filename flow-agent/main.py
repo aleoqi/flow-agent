@@ -876,6 +876,48 @@ def cmd_batch(argv):
     batch_main(argv)
 
 
+def cmd_agent(argv):
+    parser = argparse.ArgumentParser(
+        prog="flow agent",
+        description="Interact with Google Flow's native Canvas Agent (button.agent-mode-chip).",
+    )
+    parser.add_argument("prompt", help="Prompt or instruction for the Flow Canvas Agent")
+    parser.add_argument(
+        "--wait",
+        "-w",
+        type=int,
+        default=45,
+        help="Seconds to poll for agent text/media responses (default: 45)",
+    )
+    parser.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="Keep Agent mode enabled after interaction (default: auto-reset to normal generation mode)",
+    )
+    parser.add_argument("--client", default=None, help="Target Flow extension client ID")
+    args = parser.parse_args(argv)
+
+    _wait_for_generation_ready()
+    payload = {
+        "prompt": args.prompt,
+        "wait_seconds": args.wait,
+        "auto_reset_mode": not args.no_reset,
+    }
+    headers = {}
+    if args.client:
+        headers["X-Client-Id"] = args.client
+        payload["client_id"] = args.client
+
+    result, _ = _request_json(
+        "/v1/canvas/agent",
+        method="POST",
+        payload=payload,
+        headers=headers,
+        timeout=max(60, args.wait + 35),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 COMMANDS = {
     "mcp": run_mcp,
     "image": cmd_image,
@@ -886,6 +928,7 @@ COMMANDS = {
     "upload": cmd_upload,
     "credits": cmd_credits,
     "status": cmd_status,
+    "agent": cmd_agent,
 }
 
 
@@ -902,6 +945,7 @@ def _usage():
     print("  upsample   Upsample a video to 1080p or 4k")
     print("  edit       Edit a video")
     print("  upload     Upload media")
+    print("  agent      Interact with the native Flow Canvas Agent")
     print("  credits    Show Flow credits")
     print("  status     Show backend health")
 

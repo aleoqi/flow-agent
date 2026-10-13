@@ -534,6 +534,8 @@ class ExtensionBridge:
 
     async def request_media_url(self, media_id: str, client_id: str | None = None, timeout: float = 30) -> str | None:
         """Ask the extension to resolve Google's short-lived signed media URL."""
+        if hasattr(self, "_canvas_media_urls") and media_id in self._canvas_media_urls:
+            return self._canvas_media_urls[media_id]
         client_id = client_id or target_client_id_var.get() or self._select_client()
         if not client_id:
             return None
@@ -554,6 +556,46 @@ class ExtensionBridge:
         finally:
             self._pending.pop(req_id, None)
         return None
+
+    async def eval_tab(
+        self,
+        url_pattern: str = "flow.google.com/project",
+        action: str = "GET_PAGE_INFO",
+        payload: dict | None = None,
+        timeout: float = 30.0,
+        client_id: str | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """Execute a DOM/Canvas action inside the Flow tab (MAIN world) via Chrome extension."""
+        client_id = client_id or target_client_id_var.get() or self._select_client()
+        if not client_id:
+            return {"success": False, "error": "No extensions connected"}
+        req_id = str(uuid.uuid4())
+        future = self._loop.create_future()
+        self._pending[req_id] = future
+        params = {
+            "urlPattern": url_pattern,
+            "action": action,
+            "payload": payload or {},
+        }
+        if tab_id is not None:
+            params["tabId"] = tab_id
+        sent = await self.send_message_to(client_id, {"id": req_id, "method": "eval_tab", "params": params})
+        if not sent:
+            self._pending.pop(req_id, None)
+            return {"success": False, "error": f"Failed to send eval_tab to client {client_id}"}
+        try:
+            res = await asyncio.wait_for(future, timeout=timeout)
+            if isinstance(res, dict) and "id" in res and isinstance(res.get("result"), dict):
+                inner = dict(res["result"])
+                inner["_client_id"] = client_id
+                return inner
+            return res if isinstance(res, dict) else {"success": True, "result": res, "_client_id": client_id}
+        except asyncio.TimeoutError:
+            log.warning("eval_tab (%s) timed out after %ss on client %s", action, timeout, client_id)
+            return {"success": False, "error": "TIMEOUT", "_client_id": client_id}
+        finally:
+            self._pending.pop(req_id, None)
 
     def _get_global_lock(self):
         """Build or retrieve global concurrency lock for IP-wide spacing."""

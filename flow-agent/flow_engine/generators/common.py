@@ -58,6 +58,9 @@ def build_generation_context(audio_pref: str = None) -> dict:
 
 async def poll_status(bridge, media_id: str, project_id: str) -> bool:
     """Poll until video is ready. Returns True on success."""
+    if hasattr(bridge, "_canvas_media_urls") and media_id in bridge._canvas_media_urls:
+        log.info("Video ready via Canvas UI fallback! (%s)", media_id[:12])
+        return True
     body = {"media": [{"name": media_id, "projectId": project_id}]}
     start = time.time()
 
@@ -91,8 +94,9 @@ async def download_video(bridge, media_id: str, output_path: str) -> bool:
     signed_url = await bridge.request_media_url(media_id)
     if signed_url:
         try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             request = urllib.request.Request(signed_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=90) as response:
+            with opener.open(request, timeout=90) as response:
                 video_bytes = response.read()
             mime_type = sniff_media_type(video_bytes)
             if mime_type.startswith("video/"):

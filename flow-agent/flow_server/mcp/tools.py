@@ -90,7 +90,7 @@ def get_mcp_tools_list():
         },
         {
             "name": "generate_flow_video",
-            "description": "Generate 1-20 Flow videos with duration, aspect, start asset, reference-media, and delivery-resolution control (720p native, 1080p or 4K via Flow's upsampler).",
+            "description": "Generate 1-20 Flow videos with duration, aspect, start asset, seed, first-last frame, reference-media, and delivery-resolution control (720p native, 1080p or 4K via Flow's upsampler).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -111,11 +111,29 @@ def get_mcp_tools_list():
                     "duration": {"type": "integer", "enum": [4, 6, 8, 10], "default": 8},
                     "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
                     "start_media_id": {"type": "string", "description": "Optional pre-uploaded start image media ID"},
+                    "end_image_path": {
+                        "type": "string",
+                        "description": "Optional local end-frame image. With a start image this switches to first-last frame mode: the clip morphs from start to end."
+                    },
+                    "end_media_id": {
+                        "type": "string",
+                        "description": "Optional pre-uploaded end-frame media ID; same first-last frame mode as end_image_path"
+                    },
                     "ref_media_ids": {
                         "type": "array",
                         "items": {"type": "string"},
                         "maxItems": 10,
                         "description": "Optional Flow reference-media IDs for reference-to-video"
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4294967295,
+                        "description": "Explicit seed. Reuse it to re-roll a shot while holding its look; omit for a fresh random take. Multi-take requests offset from this value."
+                    },
+                    "video_model": {
+                        "type": "string",
+                        "description": "Override the Flow videoModelKey (defaults to abra_t2v_<duration>s)"
                     },
                     "resolution": {
                         "type": "string",
@@ -185,6 +203,37 @@ def get_mcp_tools_list():
                     "aspect": {"type": "string", "enum": ["landscape", "portrait"], "default": "landscape"},
                     "duration": {"type": "integer", "enum": [4, 6, 8, 10], "default": 8},
                     "ref_media_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 10}
+                },
+                "required": ["prompt"]
+            }
+        },
+        {
+            "name": "invoke_flow_canvas_agent",
+            "description": "Interact with Google Flow's native Canvas Agent (button.agent-mode-chip) for storyboarding, prompt ideation, or multi-turn canvas assistance.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Instruction or question to send to the Flow Canvas Agent"
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "maximum": 300,
+                        "default": 45,
+                        "description": "Seconds to poll for new agent text/media responses on the canvas (default: 45)"
+                    },
+                    "auto_reset_mode": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Automatically toggle off Agent mode after receiving the response so normal generation stays ready"
+                    },
+                    "client_id": {
+                        "type": "string",
+                        "default": "",
+                        "description": "Optional specific Chrome extension client ID (e.g. client-jhbh11 or client-c3zrr3)"
+                    }
                 },
                 "required": ["prompt"]
             }
