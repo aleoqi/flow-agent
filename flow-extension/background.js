@@ -125,13 +125,14 @@ async function init() {
           action: {
             type: 'modifyHeaders',
             requestHeaders: [
-              { header: 'Origin', operation: 'set', value: 'https://labs.google' },
-              { header: 'Referer', operation: 'set', value: 'https://labs.google/' }
+              { header: 'Origin', operation: 'set', value: 'https://flow.google.com' },
+              { header: 'Referer', operation: 'set', value: 'https://flow.google.com/' }
             ]
           },
           condition: {
             urlFilter: '*://aisandbox-pa.googleapis.com/*',
-            resourceTypes: ['xmlhttprequest', 'other']
+            resourceTypes: ['xmlhttprequest', 'other'],
+            excludedInitiatorDomains: ['flow.google.com']
           }
         }]
       });
@@ -587,20 +588,164 @@ async function handleAgentCommand(msg) {
       const { tabId, urlPattern, action = 'GET_PAGE_INFO', payload = {} } = msg.params || {};
       try {
         let targetId = tabId;
+        let targetWinId = null;
         if (!targetId) {
           const allTabs = await chrome.tabs.query({});
           const pattern = urlPattern || 'flow.google.com/project';
           const found = allTabs.find(t => t.url && t.url.includes(pattern));
-          if (found) targetId = found.id;
-          else if (allTabs.length) targetId = allTabs[0].id;
+          if (found) {
+            targetId = found.id;
+            targetWinId = found.windowId;
+          } else if (allTabs.length) {
+            targetId = allTabs[0].id;
+            targetWinId = allTabs[0].windowId;
+          }
         }
         if (!targetId) throw new Error('No matching tab found');
+
+        try {
+          await chrome.tabs.update(targetId, { active: true });
+          if (targetWinId) {
+            await chrome.windows.update(targetWinId, { focused: true, state: 'normal' });
+          }
+        } catch (e) {}
+
+        if (action === 'RELOAD_TAB') {
+          await chrome.tabs.reload(targetId);
+          await waitForTabComplete(targetId, 15000);
+          sendToAgent({ id: msg.id, result: { success: true, reloaded: targetId } });
+          return;
+        }
+
+        if (action === 'RESOLVE_OR_FETCH_URL') {
+          const cookies = await chrome.cookies.getAll({ domain: 'google.com' });
+          const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+          if (payload.fetchInSw || payload.includeBody) {
+            const resp = await fetch(payload.url, { credentials: 'include', redirect: 'follow' });
+            const finalUrl = resp.url;
+            const contentType = resp.headers.get('content-type') || '';
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+            }
+            const b64 = btoa(binary);
+            sendToAgent({ id: msg.id, result: { success: resp.ok, result: { success: resp.ok, status: resp.status, finalUrl, contentType, size: buf.byteLength, b64, cookieCount: cookies.length } } });
+            return;
+          }
+          sendToAgent({ id: msg.id, result: { success: true, result: { success: true, cookieHeader, cookieCount: cookies.length } } });
+          return;
+        }
+
+        if (action === 'FETCH_BASE64') {
+          try {
+            const resp = await fetch(payload.url, { credentials: 'include', redirect: 'follow' });
+            if (resp.ok) {
+              const finalUrl = resp.url;
+              const contentType = resp.headers.get('content-type') || '';
+              const buf = await resp.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let binary = '';
+              const chunkSize = 0x8000;
+              for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+              }
+              const b64 = btoa(binary);
+              sendToAgent({ id: msg.id, result: { success: true, result: { b64, size: buf.byteLength, type: contentType, finalUrl } } });
+              return;
+            }
+          } catch (swErr) {
+            // Fall through to in-tab FETCH_BASE64 if service worker fetch fails
+          }
+        }
+
+        if (action === 'CDP_CLICK') {
+          try {
+            const rectRes = await chrome.scripting.executeScript({
+              target: { tabId: targetId },
+              world: 'MAIN',
+              func: (pl) => {
+                const { selector, textMatch, x, y } = pl || {};
+                if (typeof x === 'number' && typeof y === 'number') {
+                  return { found: true, cx: x, cy: y, text: 'coords' };
+                }
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
+                let target = null;
+                if (selector) {
+                  const list = Array.from(document.querySelectorAll(selector)).filter(isVis);
+                  if (textMatch) {
+                    target = list.find(el => ((el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch)) && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                  } else {
+                    target = list.find(el => !el.closest('.agent-panel-wrapper') && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list[0];
+                  }
+                } else if (textMatch) {
+                  const all = Array.from(document.querySelectorAll('button, a, div[role="button"]')).filter(isVis);
+                  target = all.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                }
+                if (!target) return { found: false };
+                const r = target.getBoundingClientRect();
+                return {
+                  found: true,
+                  cx: Math.round(r.left + r.width / 2),
+                  cy: Math.round(r.top + r.height / 2),
+                  text: target.innerText?.trim() || target.getAttribute('aria-label') || ''
+                };
+              },
+              args: [payload],
+            });
+            const info = rectRes?.[0]?.result;
+            if (!info || !info.found) {
+              sendToAgent({ id: msg.id, result: { success: false, error: 'CDP target not found' } });
+              return;
+            }
+            const debugTarget = { tabId: targetId };
+            try { await chrome.debugger.attach(debugTarget, '1.3'); } catch (e) {}
+            const sx = Math.max(50, info.cx - 120);
+            const sy = Math.max(50, info.cy - 80);
+            for (let step = 1; step <= 6; step++) {
+              const mx = Math.round(sx + ((info.cx - sx) * step) / 6);
+              const my = Math.round(sy + ((info.cy - sy) * step) / 6);
+              await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                type: 'mouseMoved', x: mx, y: my, button: 'none'
+              });
+              await sleep(25);
+            }
+            if (!payload?.moveOnly) {
+              await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                type: 'mousePressed', x: info.cx, y: info.cy, button: 'left', clickCount: 1
+              });
+              await sleep(45);
+              await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                type: 'mouseReleased', x: info.cx, y: info.cy, button: 'left', clickCount: 1
+              });
+            }
+            try { await chrome.debugger.detach(debugTarget); } catch (e) {}
+            sendToAgent({ id: msg.id, result: { success: true, result: { clicked: !payload?.moveOnly, x: info.cx, y: info.cy, text: info.text } } });
+            return;
+          } catch (cdpErr) {
+            sendToAgent({ id: msg.id, result: { success: false, error: cdpErr.message } });
+            return;
+          }
+        }
 
         const results = await chrome.scripting.executeScript({
           target: { tabId: targetId },
           world: 'MAIN',
           func: async (act, pl, key) => {
             try {
+              try {
+                delete document.visibilityState;
+                delete document.hidden;
+                delete document.hasFocus;
+              } catch (e) {}
               if (act === 'GET_PAGE_INFO') {
                 const buttons = Array.from(document.querySelectorAll('button, div[role="button"]')).map(b => ({
                   text: b.innerText?.trim()?.slice(0, 50),
@@ -631,14 +776,18 @@ async function handleAgentCommand(msg) {
                 return { success: true, result: entries.slice(-50) };
               }
               if (act === 'HOVER') {
-                const { selector } = pl;
-                const els = Array.from(document.querySelectorAll(selector || 'img.thumbnail'));
+                const { selector, index } = pl || {};
+                const allEls = Array.from(document.querySelectorAll(selector || 'img.thumbnail'));
+                const els = (typeof index === 'number') ? [allEls[index]].filter(Boolean) : allEls;
                 els.forEach(target => {
+                  const r = target.getBoundingClientRect();
+                  const cx = Math.floor(r.left + r.width / 2) || 400;
+                  const cy = Math.floor(r.top + r.height / 2) || 300;
                   let curr = target;
                   for (let d = 0; d < 5 && curr; d++) {
-                    ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', ' pointermove', 'mousemove'].forEach(ev => {
-                      curr.dispatchEvent(new PointerEvent(ev.trim(), { bubbles: true, cancelable: true, composed: true }));
-                      curr.dispatchEvent(new MouseEvent(ev.trim(), { bubbles: true, cancelable: true, composed: true }));
+                    ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'pointermove', 'mousemove'].forEach(ev => {
+                      curr.dispatchEvent(new PointerEvent(ev, { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy }));
+                      curr.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, clientX: cx, clientY: cy }));
                     });
                     curr = curr.parentElement;
                   }
@@ -715,6 +864,22 @@ async function handleAgentCommand(msg) {
                   }
                 };
               }
+              if (act === 'FETCH_BASE64') {
+                const { url } = pl;
+                const resp = await window.fetch(url, { credentials: 'include' });
+                if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+                const blob = await resp.blob();
+                const b64 = await new Promise((resolve, reject) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => {
+                    const s = String(reader.result || '');
+                    resolve(s.includes(',') ? s.split(',')[1] : s);
+                  };
+                  reader.onerror = reject;
+                  reader.readAsDataURL(blob);
+                });
+                return { success: true, result: { b64, size: blob.size, type: blob.type } };
+              }
               if (act === 'QUERY_DOM') {
                 const { selector } = pl;
                 const els = Array.from(document.querySelectorAll(selector)).map(el => ({
@@ -724,30 +889,46 @@ async function handleAgentCommand(msg) {
                   ariaPressed: el.getAttribute('aria-pressed'),
                   src: el.getAttribute('src') || el.currentSrc || '',
                   alt: el.getAttribute('alt') || '',
+                  mediaId: el.getAttribute('data-media-id') || '',
                   disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true')
                 }));
                 return { success: true, result: els };
               }
               if (act === 'EXTRACT_MEDIA_URLS') {
-                const hoverTargets = Array.from(document.querySelectorAll('img.thumbnail, [class*="card"], [class*="media"]'));
-                hoverTargets.forEach(target => {
-                  let curr = target;
-                  for (let d = 0; d < 5 && curr; d++) {
-                    ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'mousemove'].forEach(ev => {
-                      curr.dispatchEvent(new PointerEvent(ev, { bubbles: true, cancelable: true, composed: true }));
-                      curr.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true }));
-                    });
-                    curr = curr.parentElement;
-                  }
-                });
-                await new Promise(r => setTimeout(r, 600));
-                const videos = Array.from(document.querySelectorAll('video'))
+                const vp = document.querySelector('cdk-virtual-scroll-viewport');
+                if (vp && vp.scrollTop > 0) {
+                  vp.scrollTop = 0;
+                  await new Promise(r => setTimeout(r, 120));
+                }
+                if (pl && pl.hover === true) {
+                  const hoverTargets = Array.from(document.querySelectorAll('flow-video-tile img.thumbnail'));
+                  hoverTargets.forEach(target => {
+                    const r = target.getBoundingClientRect();
+                    const cx = Math.floor(r.left + r.width / 2) || 400;
+                    const cy = Math.floor(r.top + r.height / 2) || 300;
+                    target.dispatchEvent(new PointerEvent('pointerenter', { bubbles: false, composed: true, clientX: cx, clientY: cy }));
+                    target.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, composed: true, clientX: cx, clientY: cy }));
+                  });
+                  await new Promise(r => setTimeout(r, 250));
+                }
+                const domVideos = Array.from(document.querySelectorAll('video'))
                   .map(v => (v.getAttribute('src') || v.currentSrc || '').replace(/&amp;/g, '&'))
                   .filter(Boolean);
-                const images = Array.from(document.querySelectorAll('img.thumbnail')).map(img => ({
-                  src: (img.getAttribute('src') || img.currentSrc || '').replace(/&amp;/g, '&'),
-                  alt: img.getAttribute('alt') || ''
-                }));
+                const tileVideoUrls = Array.from(document.querySelectorAll('flow-video-tile img.thumbnail'))
+                  .map(img => (img.getAttribute('src') || img.currentSrc || '').replace(/&amp;/g, '&'))
+                  .filter(u => u && u.includes('/asb/'))
+                  .map(u => u.split('?')[0].split('=')[0] + '=mm,22,15');
+                const perfVideoUrls = performance.getEntriesByType('resource')
+                  .map(r => r.name)
+                  .filter(u => u.includes('flow-content.google/video/') || u.includes('=mm,'));
+                const videos = Array.from(new Set([...tileVideoUrls, ...domVideos, ...perfVideoUrls]));
+                const images = Array.from(document.querySelectorAll('img.image, img[data-media-id], img[src*="=s1600"], img[src*="flow-content.google/image/"]'))
+                  .filter(img => !img.closest('flow-video-tile'))
+                  .map(img => ({
+                    src: (img.getAttribute('src') || img.currentSrc || '').replace(/&amp;/g, '&'),
+                    alt: img.getAttribute('alt') || '',
+                    mediaId: img.getAttribute('data-media-id') || ''
+                  }));
                 const perfUrls = performance.getEntriesByType('resource')
                   .map(r => r.name)
                   .filter(u => u.includes('flow-content.google') || u.includes('/asb/'))
@@ -756,6 +937,13 @@ async function handleAgentCommand(msg) {
               }
               if (act === 'SET_AGENT_MODE') {
                 const enabled = Boolean(pl?.enabled ?? false);
+                if (!enabled) {
+                  const closeBtn = document.querySelector('.agent-panel-header button[aria-label="Close"], .agent-panel-header button[aria-label="关闭"]');
+                  if (closeBtn) {
+                    closeBtn.click();
+                    await new Promise(r => setTimeout(r, 400));
+                  }
+                }
                 const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
                 const btn = document.querySelector('button.agent-mode-chip') ||
                   allBtns.find(b => {
@@ -763,25 +951,36 @@ async function handleAgentCommand(msg) {
                     const a = (b.getAttribute('aria-label') || '').trim();
                     return t === '智能体' || t === 'Agent' || a === '智能体' || a === 'Agent';
                   });
-                if (!btn) {
+                const panelOpen = Boolean(document.querySelector('.agent-panel-wrapper'));
+                if (!btn && !panelOpen) {
                   return { success: true, result: { found: false } };
                 }
-                const prevPressed = btn.getAttribute('aria-pressed') === 'true';
-                if (prevPressed !== enabled) {
+                const prevPressed = btn ? (btn.getAttribute('aria-pressed') === 'true') : panelOpen;
+                if (enabled && !panelOpen && btn && btn.getAttribute('aria-pressed') !== 'true') {
+                  btn.click();
+                } else if (!enabled && btn && btn.getAttribute('aria-pressed') === 'true') {
                   btn.click();
                 }
-                return { success: true, result: { found: true, enabled, prevPressed } };
+                return { success: true, result: { found: true, enabled, prevPressed, panelOpen } };
               }
               if (act === 'AGENT_INTERACT') {
                 const prompt = String(pl?.prompt || '');
+                let panelOpen = Boolean(document.querySelector('.agent-panel-wrapper'));
                 const allBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
                 const chip = document.querySelector('button.agent-mode-chip') ||
                   allBtns.find(b => (b.innerText || '').includes('智能体') || (b.getAttribute('aria-label') || '').includes('智能体') || (b.innerText || '').trim() === 'Agent');
-                if (chip && chip.getAttribute('aria-pressed') !== 'true') {
+                if (!panelOpen && chip && chip.getAttribute('aria-pressed') !== 'true') {
                   chip.click();
-                  await new Promise(r => setTimeout(r, 500));
+                  await new Promise(r => setTimeout(r, 800));
                 }
-                const el = document.querySelector('.ProseMirror, textarea, input[type="text"]');
+                const agentInstrBtn = document.querySelector('button[aria-label="智能体指令"], button[aria-label="Agent instructions"]');
+                if (agentInstrBtn && !document.querySelector('.agent-panel-wrapper') && agentInstrBtn.getAttribute('aria-pressed') !== 'true') {
+                  agentInstrBtn.click();
+                  await new Promise(r => setTimeout(r, 800));
+                }
+                panelOpen = Boolean(document.querySelector('.agent-panel-wrapper'));
+                const el = document.querySelector('.agent-panel-wrapper .ProseMirror, .agent-panel-prompt-box:not(.agent-panel-prompt-box-hidden) .ProseMirror') ||
+                  document.querySelector('flow-prompt-box .ProseMirror, .ProseMirror, textarea, input[type="text"]');
                 if (!el) return { success: false, error: 'Input element not found' };
                 el.focus();
                 if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
@@ -790,58 +989,63 @@ async function handleAgentCommand(msg) {
                   range.selectNodeContents(el);
                   sel.removeAllRanges();
                   sel.addRange(range);
-                  const ok = document.execCommand('insertText', false, prompt);
-                  if (!ok || !el.innerText?.includes(prompt.slice(0, 20))) {
-                    el.innerText = prompt;
-                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+                  const dt = new DataTransfer();
+                  dt.setData('text/plain', prompt);
+                  el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                  await new Promise(r => setTimeout(r, 200));
+                  if (!el.innerText?.includes(prompt.slice(0, 10))) {
+                    const sel2 = window.getSelection();
+                    const range2 = document.createRange();
+                    range2.selectNodeContents(el);
+                    sel2.removeAllRanges();
+                    sel2.addRange(range2);
+                    document.execCommand('insertText', false, prompt);
                   }
+                  el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: prompt }));
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
                 } else {
                   el.value = prompt;
                   el.dispatchEvent(new Event('input', { bubbles: true }));
                   el.dispatchEvent(new Event('change', { bubbles: true }));
                 }
                 await new Promise(r => setTimeout(r, 500));
-                let submitBtn = document.querySelector('button[aria-label="开始生成"], button[aria-label="发送"], button[aria-label*="Send"], button[aria-label*="Submit"]');
-                if (!submitBtn) {
-                  let container = el.parentElement;
-                  for (let i = 0; i < 6 && container; i++) {
-                    const candidateBtns = Array.from(container.querySelectorAll('button')).filter(b => {
-                      if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
-                      if (b.classList.contains('agent-mode-chip')) return false;
-                      const label = (b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '');
-                      if (label.includes('设置触发器') || label.includes('智能体') || label.includes('添加') || label.includes('Add') || label.includes('开始') && label.trim() === '开始' || label.trim() === '结束') return false;
-                      return true;
-                    });
-                    if (candidateBtns.length > 0) {
-                      submitBtn = candidateBtns[candidateBtns.length - 1];
-                      break;
-                    }
-                    container = container.parentElement;
+                let submitBtn = null;
+                for (let retry = 0; retry < 15; retry++) {
+                  submitBtn = document.querySelector('.agent-panel-wrapper button.generate-icon-button, .agent-panel-prompt-box button.generate-icon-button') ||
+                    document.querySelector('flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label="开始生成"], button[aria-label="Start generation"], button[aria-label="发送"], button[aria-label*="Send"], button[aria-label*="Submit"]');
+                  if (submitBtn && !submitBtn.disabled && submitBtn.getAttribute('aria-disabled') !== 'true') {
+                    break;
                   }
+                  await new Promise(r => setTimeout(r, 200));
                 }
-                if (submitBtn) {
+                if (submitBtn && !submitBtn.disabled && submitBtn.getAttribute('aria-disabled') !== 'true') {
                   submitBtn.click();
-                  return { success: true, result: { submitted: true, agentChipFound: Boolean(chip), promptLength: prompt.length } };
+                  return { success: true, result: { submitted: true, agentChipFound: Boolean(chip || panelOpen), promptLength: prompt.length } };
                 }
-                return { success: false, error: 'Submit button not found', result: { submitted: false, agentChipFound: Boolean(chip), promptLength: prompt.length } };
+                return { success: false, error: 'Submit button not found or disabled', result: { submitted: false, agentChipFound: Boolean(chip || panelOpen), promptLength: prompt.length } };
               }
               if (act === 'CLICK') {
                 const { selector, textMatch } = pl;
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
                 let target = null;
                 if (selector) {
-                  const list = Array.from(document.querySelectorAll(selector));
+                  const list = Array.from(document.querySelectorAll(selector)).filter(isVis);
                   if (textMatch) {
-                    target = list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                    target = list.find(el => ((el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch)) && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
                   } else {
-                    target = list[0];
+                    target = list.find(el => !el.closest('.agent-panel-wrapper') && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list[0];
                   }
-                }
-                if (!target && textMatch) {
-                  const all = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                } else if (textMatch) {
+                  const all = Array.from(document.querySelectorAll('button, a, div[role="button"]')).filter(isVis);
                   target = all.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
                 }
                 if (target) {
-                  target.scrollIntoView({ behavior: 'instant', block: 'center' });
                   target.click();
                   return { success: true, result: { clicked: true, text: target.innerText?.trim() || target.getAttribute('aria-label') } };
                 }
@@ -849,7 +1053,12 @@ async function handleAgentCommand(msg) {
               }
               if (act === 'INPUT_TEXT') {
                 const { selector, text } = pl;
-                const el = document.querySelector(selector || '.ProseMirror, textarea, input');
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
+                const candidates = Array.from(document.querySelectorAll(selector || 'flow-prompt-box .ProseMirror, .ProseMirror, textarea, input')).filter(isVis);
+                const el = candidates.find(e => !e.closest('.agent-panel-wrapper')) || candidates[0];
                 if (!el) return { success: false, error: 'Input element not found' };
                 el.focus();
                 if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
@@ -858,11 +1067,21 @@ async function handleAgentCommand(msg) {
                   range.selectNodeContents(el);
                   sel.removeAllRanges();
                   sel.addRange(range);
-                  const ok = document.execCommand('insertText', false, text);
-                  if (!ok || !el.innerText?.includes(text.slice(0, 20))) {
-                    el.innerText = text;
-                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                  const dt = new DataTransfer();
+                  dt.setData('text/plain', text);
+                  el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                  await new Promise(r => setTimeout(r, 200));
+                  if (!el.innerText?.includes(text.slice(0, 15))) {
+                    const sel2 = window.getSelection();
+                    const range2 = document.createRange();
+                    range2.selectNodeContents(el);
+                    sel2.removeAllRanges();
+                    sel2.addRange(range2);
+                    document.execCommand('insertText', false, text);
                   }
+                  el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
                   return { success: true, result: { text: el.innerText?.slice(0, 100) } };
                 } else {
                   el.value = text;
@@ -870,6 +1089,51 @@ async function handleAgentCommand(msg) {
                   el.dispatchEvent(new Event('change', { bubbles: true }));
                   return { success: true, result: { value: el.value } };
                 }
+              }
+              if (act === 'GET_RECT') {
+                const { selector, textMatch } = pl || {};
+                const isVis = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                };
+                let target = null;
+                if (selector) {
+                  const list = Array.from(document.querySelectorAll(selector)).filter(isVis);
+                  if (textMatch) {
+                    target = list.find(el => ((el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch)) && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                  } else {
+                    target = list.find(el => !el.closest('.agent-panel-wrapper') && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list.find(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true') ||
+                             list[0];
+                  }
+                } else if (textMatch) {
+                  const all = Array.from(document.querySelectorAll('button, a, div[role="button"]')).filter(isVis);
+                  target = all.find(el => (el.innerText || '').includes(textMatch) || (el.getAttribute('aria-label') || '').includes(textMatch));
+                }
+                const winInfo = {
+                  screenX: window.screenX,
+                  screenY: window.screenY,
+                  outerWidth: window.outerWidth,
+                  outerHeight: window.outerHeight,
+                  innerWidth: window.innerWidth,
+                  innerHeight: window.innerHeight,
+                  dpr: window.devicePixelRatio || 1,
+                };
+                if (!target) {
+                  return { success: true, result: { found: false, win: winInfo } };
+                }
+                const r = target.getBoundingClientRect();
+                return {
+                  success: true,
+                  result: {
+                    found: true,
+                    win: winInfo,
+                    rect: { left: r.left, top: r.top, width: r.width, height: r.height, cx: r.left + r.width / 2, cy: r.top + r.height / 2 },
+                    text: target.innerText?.trim() || target.getAttribute('aria-label') || '',
+                    disabled: Boolean(target.disabled || target.getAttribute('aria-disabled') === 'true')
+                  }
+                };
               }
               return { success: false, error: `Unknown action: ${act}` };
             } catch (err) {
@@ -1445,16 +1709,10 @@ async function _solveCaptchaInternal(requestId, captchaAction) {
           };
           try {
             try {
+              delete document.visibilityState;
+              delete document.hidden;
+              delete document.hasFocus;
               window.focus();
-              window.dispatchEvent(new Event('focus'));
-              Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-              Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-              document.hasFocus = () => true;
-              document.dispatchEvent(new MouseEvent('mousemove', {
-                bubbles: true,
-                clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
-                clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36)),
-              }));
             } catch (e) {}
 
             async function run() {
@@ -1700,22 +1958,35 @@ async function handleApiRequest(msg) {
           }
         }
 
+        // Dispatch trusted CDP mouse movement before reCAPTCHA execution
+        try {
+          if (chrome.debugger) {
+            const dbg = { tabId: targetTabId };
+            try { await chrome.debugger.attach(dbg, '1.3'); } catch (e) {}
+            const pts = [[320, 260], [380, 290], [450, 310], [510, 280]];
+            for (const [px, py] of pts) {
+              await chrome.debugger.sendCommand(dbg, 'Input.dispatchMouseEvent', {
+                type: 'mouseMoved', x: px + Math.floor(Math.random() * 15), y: py + Math.floor(Math.random() * 15), button: 'none'
+              });
+              await sleep(20);
+            }
+            try { await chrome.debugger.detach(dbg); } catch (e) {}
+          }
+        } catch (e) {}
+
+        const inPageHeaders = { ...(headers || {}) };
+        inPageHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+
         const evalResults = await chrome.scripting.executeScript({
           target: { tabId: targetTabId },
           world: 'MAIN',
-          func: async ({ websiteKey, actionName, payload, waitTimeoutMs }) => {
+          func: async ({ websiteKey, actionName, payload, waitTimeoutMs, reqUrl, reqMethod, reqHeaders }) => {
             try {
               try {
+                delete document.visibilityState;
+                delete document.hidden;
+                delete document.hasFocus;
                 window.focus();
-                window.dispatchEvent(new Event('focus'));
-                Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-                Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-                document.hasFocus = () => true;
-                document.dispatchEvent(new MouseEvent('mousemove', {
-                  bubbles: true,
-                  clientX: Math.max(32, Math.floor((window.innerWidth || 1280) * 0.42)),
-                  clientY: Math.max(32, Math.floor((window.innerHeight || 720) * 0.36)),
-                }));
               } catch (e) {}
 
               const waitForEnterprise = () => new Promise((resolve) => {
@@ -1791,10 +2062,29 @@ async function handleApiRequest(msg) {
               const bodyToSend = payload ? JSON.parse(JSON.stringify(payload)) : payload;
               patchPayload(bodyToSend);
 
-              return {
-                token,
-                patchedBody: bodyToSend,
-              };
+              try {
+                const pageResp = await window.fetch(reqUrl, {
+                  method: reqMethod || 'POST',
+                  headers: reqHeaders,
+                  credentials: 'include',
+                  body: (reqMethod || 'POST') === 'GET' ? undefined : JSON.stringify(bodyToSend),
+                });
+                const pageText = await pageResp.text();
+                return {
+                  token,
+                  patchedBody: bodyToSend,
+                  inPageFetched: true,
+                  pageStatus: pageResp.status,
+                  pageOk: pageResp.ok,
+                  pageText,
+                };
+              } catch (fetchErr) {
+                return {
+                  token,
+                  patchedBody: bodyToSend,
+                  inPageFetched: false,
+                };
+              }
             } catch (err) {
               return { captchaError: err?.message || 'In-page script failed' };
             }
@@ -1804,6 +2094,9 @@ async function handleApiRequest(msg) {
             actionName: captchaAction || 'IMAGE_GENERATION',
             payload: finalBody,
             waitTimeoutMs: scriptTimeoutMs,
+            reqUrl: targetUrl,
+            reqMethod: method || 'POST',
+            reqHeaders: inPageHeaders,
           }],
         });
 
@@ -1827,18 +2120,24 @@ async function handleApiRequest(msg) {
         return;
       }
 
-      const fetchHeaders = { ...(headers || {}) };
-      fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+      if (inPageResult.inPageFetched) {
+        responseStatus = inPageResult.pageStatus;
+        responseOk = inPageResult.pageOk;
+        responseText = inPageResult.pageText;
+      } else {
+        const fetchHeaders = { ...(headers || {}) };
+        fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
 
-      const swResponse = await fetch(inPageResult.targetUrl || url, {
-        method: method || 'POST',
-        headers: fetchHeaders,
-        credentials: 'include',
-        body: (method || 'POST') === 'GET' ? undefined : JSON.stringify(inPageResult.patchedBody),
-      });
-      responseStatus = swResponse.status;
-      responseOk = swResponse.ok;
-      responseText = await swResponse.text();
+        const swResponse = await fetch(inPageResult.targetUrl || url, {
+          method: method || 'POST',
+          headers: fetchHeaders,
+          credentials: 'include',
+          body: (method || 'POST') === 'GET' ? undefined : JSON.stringify(inPageResult.patchedBody),
+        });
+        responseStatus = swResponse.status;
+        responseOk = swResponse.ok;
+        responseText = await swResponse.text();
+      }
     } else {
       const fetchHeaders = { ...(headers || {}) };
       fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;

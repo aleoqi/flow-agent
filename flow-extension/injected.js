@@ -13,51 +13,47 @@ const SITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
 // Fresh signed GCS URLs are extracted and forwarded to the agent.
 
 const _originalFetch = window.fetch;
-window.fetch = async function (...args) {
-  try {
-    const opts = args[1];
-    let authHeader = null;
-    if (opts && opts.headers) {
-      if (typeof opts.headers.get === 'function') {
-        authHeader = opts.headers.get('authorization') || opts.headers.get('Authorization');
-      } else if (typeof opts.headers === 'object') {
-        authHeader = opts.headers['authorization'] || opts.headers['Authorization'];
-      }
-    }
-    if (authHeader && /^bearer\s+ya29\./i.test(authHeader)) {
-      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-      window.dispatchEvent(new CustomEvent('TOKEN_INTERCEPTED', { detail: { token } }));
-    }
-  } catch {}
-
-  const response = await _originalFetch.apply(this, args);
-  try {
-    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
-    // Only intercept TRPC calls on labs.google that return project/flow data
-    if (url.includes('/fx/api/trpc/') && response.ok) {
-      const clone = response.clone();
-      clone.text().then(text => {
-        if (text.includes('storage.googleapis.com/ai-sandbox-videofx/') || text.includes('flow-content.google/')) {
-          window.dispatchEvent(new CustomEvent('TRPC_MEDIA_URLS', {
-            detail: { url, body: text },
-          }));
+if (!window.location.hostname.includes('flow.google.com')) {
+  window.fetch = async function (...args) {
+    try {
+      const opts = args[1];
+      let authHeader = null;
+      if (opts && opts.headers) {
+        if (typeof opts.headers.get === 'function') {
+          authHeader = opts.headers.get('authorization') || opts.headers.get('Authorization');
+        } else if (typeof opts.headers === 'object') {
+          authHeader = opts.headers['authorization'] || opts.headers['Authorization'];
         }
-      }).catch(() => {});
-    }
-  } catch {}
-  return response;
-};
+      }
+      if (authHeader && /^bearer\s+ya29\./i.test(authHeader)) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        window.dispatchEvent(new CustomEvent('TOKEN_INTERCEPTED', { detail: { token } }));
+      }
+    } catch {}
+
+    const response = await _originalFetch.apply(this, args);
+    try {
+      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+      // Only intercept TRPC calls on labs.google that return project/flow data
+      if (url.includes('/fx/api/trpc/') && response.ok) {
+        const clone = response.clone();
+        clone.text().then(text => {
+          if (text.includes('storage.googleapis.com/ai-sandbox-videofx/') || text.includes('flow-content.google/')) {
+            window.dispatchEvent(new CustomEvent('TRPC_MEDIA_URLS', {
+              detail: { url, body: text },
+            }));
+          }
+        }).catch(() => {});
+      }
+    } catch {}
+    return response;
+  };
+}
 
 
 window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   const { requestId, pageAction } = detail;
   try {
-    try {
-      Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-      Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-      document.hasFocus = () => true;
-      window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 200 }));
-    } catch (e) {}
 
     const exec = async (act) => {
       if (window.grecaptcha?.enterprise?.execute) {

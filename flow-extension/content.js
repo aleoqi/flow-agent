@@ -2,7 +2,7 @@
  * Content script — bridge between background.js and injected.js
  * Injects injected.js into MAIN world to access window.grecaptcha
  */
-if (!globalThis.__FLOW_AGENT_CONTENT_LOADED__) {
+if (!window.location.hostname.includes('flow.google.com') && !globalThis.__FLOW_AGENT_CONTENT_LOADED__) {
 globalThis.__FLOW_AGENT_CONTENT_LOADED__ = true;
 
 (function () {

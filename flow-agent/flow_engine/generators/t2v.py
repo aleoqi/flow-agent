@@ -27,7 +27,6 @@ async def generate_video(bridge, prompt: str, aspect: str, project_id: str,
     requests = []
     for i in range(count):
         requests.append({
-            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,

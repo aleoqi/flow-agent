@@ -17,9 +17,12 @@
     "webRequestExtraHeaders",
     "scripting",
     "declarativeNetRequest",
-    "sidePanel"
+    "sidePanel",
+    "debugger"
   ],
   "host_permissions": [
+    "<all_urls>",
+    "https://*.google.com/*",
     "https://labs.google/*",
     "https://flow.google.com/*",
     "https://aisandbox-pa.googleapis.com/*",
@@ -38,8 +41,7 @@
       "matches": [
         "https://labs.google/fx*",
         "https://labs.google/fx/tools/flow*",
-        "https://labs.google/fx/*/tools/flow*",
-        "https://flow.google.com/*"
+        "https://labs.google/fx/*/tools/flow*"
       ],
       "js": [
         "content.js"
@@ -53,8 +55,7 @@
         "injected.js"
       ],
       "matches": [
-        "https://labs.google/*",
-        "https://flow.google.com/*"
+        "https://labs.google/*"
       ]
     }
   ],

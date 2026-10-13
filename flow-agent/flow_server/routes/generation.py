@@ -270,7 +270,15 @@ async def _generate_image(req: ImageGenerationRequest, x_client_id: Optional[str
         if not r.get("_upscaled"):
             filename = f"flowagent_img_{timestamp}_{unique_id}_{i+1}.png"
             out_path = os.path.join(OUTPUT_DIR, filename)
-            download_success = await download_image(active_bridge, url, out_path)
+            if r.get("encoded_image"):
+                img_bytes = base64.b64decode(r["encoded_image"])
+                with open(out_path, "wb") as f:
+                    f.write(img_bytes)
+                download_success = True
+            else:
+                download_success = await download_image(
+                    active_bridge, url, out_path, client_id=r.get("_client_id") or x_client_id
+                )
             if not download_success:
                 # Generation succeeded but the local download failed (e.g. transient
                 # network/proxy block). Don't lose it — surface the remote URL and

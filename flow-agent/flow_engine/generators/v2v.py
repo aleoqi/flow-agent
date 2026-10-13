@@ -24,7 +24,6 @@ async def edit_video(bridge, prompt: str, aspect: str, project_id: str,
     ] if ref_media_ids else None
 
     req_item = {
-        "clientContext": build_client_context(project_id),
         "aspectRatio": aspect,
         "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
         "videoModelKey": "abra_edit",

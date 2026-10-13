@@ -156,7 +156,6 @@ async def upsample_video(
     last_error = None
     for attempt, resolution_enum in enumerate(_resolution_candidates(tier)):
         request_item = {
-            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "videoModelKey": model_key,
             "seed": resolve_seed(seed),

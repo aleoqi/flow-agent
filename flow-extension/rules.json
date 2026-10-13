@@ -5,13 +5,14 @@
     "action": {
       "type": "modifyHeaders",
       "requestHeaders": [
-        { "header": "Origin", "operation": "set", "value": "https://labs.google" },
-        { "header": "Referer", "operation": "set", "value": "https://labs.google/" }
+        { "header": "Origin", "operation": "set", "value": "https://flow.google.com" },
+        { "header": "Referer", "operation": "set", "value": "https://flow.google.com/" }
       ]
     },
     "condition": {
       "urlFilter": "*://aisandbox-pa.googleapis.com/*",
-      "resourceTypes": ["xmlhttprequest", "other"]
+      "resourceTypes": ["xmlhttprequest", "other"],
+      "excludedInitiatorDomains": ["flow.google.com"]
     }
   }
 ]

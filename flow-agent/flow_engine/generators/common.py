@@ -93,6 +93,21 @@ async def download_video(bridge, media_id: str, output_path: str) -> bool:
     """Download video from Google's signed URL, with legacy API fallback."""
     signed_url = await bridge.request_media_url(media_id)
     if signed_url:
+        if "/asb/" in signed_url:
+            try:
+                from ..canvas_driver import _download_canvas_image_b64
+                b64 = await _download_canvas_image_b64(bridge, signed_url)
+                if b64:
+                    video_bytes = base64.b64decode(b64)
+                    mime_type = sniff_media_type(video_bytes)
+                    if mime_type.startswith("video/"):
+                        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                        with open(output_path, "wb") as f:
+                            f.write(video_bytes)
+                        log.info("Saved /asb/ video URL: %s (%.1f MB, %s)", output_path, len(video_bytes) / (1024 * 1024), mime_type)
+                        return True
+            except Exception as exc:
+                log.warning("In-tab /asb/ video download failed for %s: %s", media_id, exc)
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             request = urllib.request.Request(signed_url, headers={"User-Agent": "Mozilla/5.0"})

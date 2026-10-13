@@ -95,7 +95,6 @@ async def generate_video_i2v(bridge, prompt: str, aspect: str, project_id: str,
     requests = []
     for i in range(count):
         requests.append({
-            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,
@@ -175,7 +174,6 @@ async def generate_video_fl(bridge, prompt: str, aspect: str, project_id: str,
     requests = []
     for i in range(count):
         requests.append({
-            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,
@@ -259,7 +257,6 @@ async def generate_video_r2v(bridge, prompt: str, aspect: str, project_id: str,
     requests = []
     for i in range(count):
         requests.append({
-            "clientContext": build_client_context(project_id),
             "aspectRatio": aspect,
             "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
             "videoModelKey": model_key,

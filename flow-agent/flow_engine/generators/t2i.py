@@ -45,7 +45,7 @@ def _parse_image_results(data: dict) -> list[dict]:
         # media[i].image.generatedImage.fifeUrl
         img = item.get("image", {})
         gen = img.get("generatedImage", {})
-        url = gen.get("fifeUrl", "") or gen.get("imageUri", "")
+        url = gen.get("fifeUrl", "") or gen.get("imageUri", "") or item.get("fife_url", "")
         if url:
             r["image_url"] = url
             # Fallback: extract mediaId from URL
@@ -53,6 +53,8 @@ def _parse_image_results(data: dict) -> list[dict]:
                 match = UUID_RE.search(url)
                 if match:
                     r["media_id"] = match.group()
+        if img.get("encodedImage"):
+            r["encoded_image"] = img["encodedImage"]
 
         results.append(r)
 
@@ -197,18 +199,29 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
     return results
 
 
-async def download_image(bridge, image_url: str, output_path: str) -> bool:
+async def download_image(bridge, image_url: str, output_path: str, client_id: str | None = None) -> bool:
     """Download a generated image to disk.
 
-    The image URL is a public Google Storage signed URL, so it must be fetched
-    directly — never through a corporate/HTTP proxy (those reject GCS with 403).
-    A direct opener is used and the fetch is retried a few times to ride out
-    transient network blips.
+    Supports both public signed GCS URLs and cookie-authenticated `/asb/` URLs
+    via in-tab `FETCH_BASE64`.
     """
+    import base64
     import urllib.request
     import time as _time
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    if "/asb/" in (image_url or ""):
+        from ..canvas_driver import _download_canvas_image_b64
+        b64 = await _download_canvas_image_b64(bridge, image_url, client_id=client_id)
+        if b64:
+            image_bytes = base64.b64decode(b64)
+            mime_type = sniff_media_type(image_bytes, filename=image_url)
+            if mime_type.startswith("image/"):
+                with open(output_path, "wb") as f:
+                    f.write(image_bytes)
+                log.info("Saved (/asb/ in-tab): %s (%.0f KB, %s)", output_path, len(image_bytes) / 1024, mime_type)
+                return True
 
     # Bypass any *_proxy env vars: signed GCS URLs 403 through most proxies.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
