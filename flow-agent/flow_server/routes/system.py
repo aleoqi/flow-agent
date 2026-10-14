@@ -284,6 +284,21 @@ async def eval_tab(body: dict = Body(...), x_client_id: Optional[str] = Header(N
         bridge._pending.pop(req_id, None)
 
 
+@router.post("/v1/system/reload-extension")
+async def reload_extension_endpoint(x_client_id: Optional[str] = Header(None, alias="X-Client-Id")):
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    target_clients = [x_client_id] if x_client_id else list(bridge._clients.keys())
+    results = {}
+    for cid in target_clients:
+        req_id = str(uuid.uuid4())
+        msg = {"id": req_id, "method": "reload_extension"}
+        sent = await bridge.send_message_to(cid, msg)
+        results[cid] = sent
+    return {"reloaded": results}
+
+
 @router.post("/v1/canvas/agent", dependencies=[Depends(verify_api_key)])
 async def canvas_agent_endpoint(
     body: dict = Body(...),

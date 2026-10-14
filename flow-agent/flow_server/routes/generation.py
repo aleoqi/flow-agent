@@ -729,7 +729,7 @@ async def _upsample_video(req: VideoUpsampleRequest, x_client_id: Optional[str] 
     """Upsample one finished video to a higher delivery resolution."""
     target_client_id_var.set(x_client_id)
     active_bridge = await get_active_bridge()
-    project_id = os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
+    project_id = req.project_id or os.environ.get("DEFAULT_PROJECT", DEFAULT_PROJECT)
 
     tier = await _resolve_upsample_tier(req.resolution)
     if tier is None:

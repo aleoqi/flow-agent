@@ -70,6 +70,7 @@ class VideoUpsampleRequest(BaseModel):
     resolution: str = Field("1080p", description="Target resolution: '1080p' (free) or '4k' (paid, higher tier)")
     aspect: str = Field("landscape", description="Aspect ratio of the source video (portrait or landscape)")
     seed: Optional[int] = Field(None, ge=0, le=4294967295, description="Optional explicit upsampler seed")
+    project_id: Optional[str] = Field(None, description="Project ID containing the source video")
 
 
 class GeneratedMedia(BaseModel):

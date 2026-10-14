@@ -803,6 +803,7 @@ class ExtensionBridge:
 
         client_projects = {
             "client-jhbh11": "bbdc5477-57f7-4953-89b3-7c3ddaa0546e",
+            "client-2w3w0d": "b1f63d8c-33e2-4713-9a34-1a40779774b6",
             "client-c3zrr3": "515751c4-c884-42a3-9561-5a1d7ddddcb4",
         }
         client_proj = client_projects.get(client_id)
@@ -815,7 +816,7 @@ class ExtensionBridge:
                 flags=_re.IGNORECASE,
             )
 
-        url = f"{API_BASE}{url_path}?key={API_KEY}"
+        url = f"{API_BASE}{url_path}"
         ua = random.choice(USER_AGENTS)
         platform = '"Windows"'
 

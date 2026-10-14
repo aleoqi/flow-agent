@@ -291,35 +291,27 @@ async def canvas_generate_image(
             pre_media = await canvas_extract_media(bridge, client_id=cid)
             pre_img_bases = {_base_url(img.get("src", "")) for img in pre_media.get("images", []) if img.get("src")}
 
-            # Input prompt & click generate
-            await bridge.eval_tab(
+            # Clear & type prompt, then submit via authentic CDP key/mouse events
+            type_res = await bridge.eval_tab(
                 url_pattern="flow.google.com/project",
-                action="INPUT_TEXT",
-                payload={"selector": "flow-prompt-box .ProseMirror, .ProseMirror", "text": prompt},
-                timeout=20,
+                action="CDP_CLEAR_AND_TYPE",
+                payload={"selector": "flow-prompt-box .ProseMirror, .ProseMirror", "text": prompt, "submit": True},
+                timeout=25,
                 client_id=cid,
             )
-            await asyncio.sleep(0.5)
-            click_gen = await bridge.eval_tab(
-                url_pattern="flow.google.com/project",
-                action="CDP_CLICK",
-                payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
-                timeout=15,
-                client_id=cid,
-            )
-            if not click_gen.get("success"):
-                click_gen = await bridge.eval_tab(
+            if not type_res.get("success"):
+                await bridge.eval_tab(
                     url_pattern="flow.google.com/project",
-                    action="CLICK",
-                    payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
+                    action="CLEAR_AND_TYPE",
+                    payload={"text": prompt},
                     timeout=15,
                     client_id=cid,
                 )
-            if not click_gen.get("success"):
+                await asyncio.sleep(0.5)
                 await bridge.eval_tab(
                     url_pattern="flow.google.com/project",
-                    action="CLICK",
-                    payload={"selector": "button", "textMatch": "开始生成"},
+                    action="CDP_CLICK",
+                    payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
                     timeout=15,
                     client_id=cid,
                 )
@@ -476,35 +468,27 @@ async def canvas_generate_video(
             pre_media = await canvas_extract_media(bridge, client_id=cid)
             pre_video_bases = {_base_url(u) for u in pre_media.get("videos", []) if u}
 
-            # Input prompt & click generate
-            await bridge.eval_tab(
+            # Clear & type prompt, then submit via authentic CDP key/mouse events
+            type_res = await bridge.eval_tab(
                 url_pattern="flow.google.com/project",
-                action="INPUT_TEXT",
-                payload={"selector": "flow-prompt-box .ProseMirror, .ProseMirror", "text": prompt},
-                timeout=20,
+                action="CDP_CLEAR_AND_TYPE",
+                payload={"selector": "flow-prompt-box .ProseMirror, .ProseMirror", "text": prompt, "submit": True},
+                timeout=25,
                 client_id=cid,
             )
-            await asyncio.sleep(0.5)
-            click_gen = await bridge.eval_tab(
-                url_pattern="flow.google.com/project",
-                action="CDP_CLICK",
-                payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
-                timeout=15,
-                client_id=cid,
-            )
-            if not click_gen.get("success"):
-                click_gen = await bridge.eval_tab(
+            if not type_res.get("success"):
+                await bridge.eval_tab(
                     url_pattern="flow.google.com/project",
-                    action="CLICK",
-                    payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
+                    action="CLEAR_AND_TYPE",
+                    payload={"text": prompt},
                     timeout=15,
                     client_id=cid,
                 )
-            if not click_gen.get("success"):
+                await asyncio.sleep(0.5)
                 await bridge.eval_tab(
                     url_pattern="flow.google.com/project",
-                    action="CLICK",
-                    payload={"selector": "button", "textMatch": "开始生成"},
+                    action="CDP_CLICK",
+                    payload={"selector": "flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成'], button[aria-label='Start generation']"},
                     timeout=15,
                     client_id=cid,
                 )

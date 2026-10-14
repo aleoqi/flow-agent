@@ -125,14 +125,13 @@ async function init() {
           action: {
             type: 'modifyHeaders',
             requestHeaders: [
-              { header: 'Origin', operation: 'set', value: 'https://labs.google' },
-              { header: 'Referer', operation: 'set', value: 'https://labs.google/' }
+              { header: 'Origin', operation: 'set', value: 'https://flow.google.com' },
+              { header: 'Referer', operation: 'set', value: 'https://flow.google.com/' }
             ]
           },
           condition: {
             urlFilter: '*://aisandbox-pa.googleapis.com/*',
-            resourceTypes: ['xmlhttprequest', 'other'],
-            excludedInitiatorDomains: ['flow.google.com']
+            resourceTypes: ['xmlhttprequest', 'other']
           }
         }]
       });
@@ -205,6 +204,33 @@ try {
     ] },
     ['requestHeaders'],
   );
+}
+
+let _capturedDownloadUrls = [];
+try {
+  chrome.downloads.onCreated.addListener((item) => {
+    console.log('[Flow Agent] Captured chrome.downloads item:', item.url);
+    if (item.url) {
+      _capturedDownloadUrls.push({ url: item.url, filename: item.filename, id: item.id, time: Date.now() });
+      chrome.storage.local.set({ capturedDownloadUrls: _capturedDownloadUrls.slice(-20) });
+    }
+  });
+} catch (e) {
+  console.warn('[Flow Agent] downloads listener error:', e);
+}
+
+let _capturedMediaUrls = [];
+try {
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (details.url && (details.url.includes('flow-content.google') || details.url.includes('.mp4') || details.url.includes('/video/'))) {
+        _capturedMediaUrls.push({ url: details.url, type: details.type, time: Date.now() });
+      }
+    },
+    { urls: ['https://flow-content.google/*', 'https://*.google.com/*', 'https://*.googleapis.com/*'] }
+  );
+} catch (e) {
+  console.warn('[Flow Agent] media webRequest listener error:', e);
 }
 
 let _openingFlowTab = false;
@@ -617,6 +643,19 @@ async function handleAgentCommand(msg) {
           return;
         }
 
+        if (action === 'NAVIGATE') {
+          await chrome.tabs.update(targetId, { url: payload.url });
+          await waitForTabComplete(targetId, 15000);
+          sendToAgent({ id: msg.id, result: { success: true, url: payload.url } });
+          return;
+        }
+
+        if (action === 'GET_DOWNLOAD_URLS') {
+          const chromeDownloads = await chrome.downloads.search({ limit: 10 }).catch(() => []);
+          sendToAgent({ id: msg.id, result: { success: true, downloadUrls: _capturedDownloadUrls, chromeDownloads, mediaUrls: _capturedMediaUrls.slice(-20) } });
+          return;
+        }
+
         if (action === 'RESOLVE_OR_FETCH_URL') {
           const cookies = await chrome.cookies.getAll({ domain: 'google.com' });
           const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -756,6 +795,33 @@ async function handleAgentCommand(msg) {
           }
         }
 
+        if (action === 'CDP_EVAL') {
+          try {
+            const debugTarget = { tabId: targetId };
+            let token = flowKey;
+            if (!token) {
+              const stored = await chrome.storage.local.get(['flowKey']);
+              token = stored.flowKey || '';
+            }
+            let expr = payload.expression || '';
+            if (token) {
+              expr = expr.replaceAll('__FLOW_BEARER_TOKEN__', token);
+            }
+            try { await chrome.debugger.attach(debugTarget, '1.3'); } catch (e) {}
+            const evalRes = await chrome.debugger.sendCommand(debugTarget, 'Runtime.evaluate', {
+              expression: expr,
+              awaitPromise: true,
+              returnByValue: true,
+            });
+            try { await chrome.debugger.detach(debugTarget); } catch (e) {}
+            sendToAgent({ id: msg.id, result: { success: true, result: evalRes.result?.value, exceptionDetails: evalRes.exceptionDetails } });
+            return;
+          } catch (cdpErr) {
+            sendToAgent({ id: msg.id, result: { success: false, error: cdpErr.message } });
+            return;
+          }
+        }
+
         if (action === 'CDP_CLEAR_AND_TYPE') {
           try {
             const rectRes = await chrome.scripting.executeScript({
@@ -818,6 +884,65 @@ async function handleAgentCommand(msg) {
             // Insert text
             if (payload?.text) {
               await chrome.debugger.sendCommand(debugTarget, 'Input.insertText', { text: payload.text });
+              await chrome.scripting.executeScript({
+                target: { tabId: targetId },
+                world: 'MAIN',
+                func: (text) => {
+                  const isVis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !el.closest('.agent-panel-prompt-box-hidden');
+                  };
+                  const candidates = Array.from(document.querySelectorAll('flow-prompt-box .ProseMirror, .ProseMirror, [contenteditable="true"]')).filter(isVis);
+                  const el = candidates[0];
+                  if (el) {
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                  }
+                },
+                args: [payload.text]
+              });
+            }
+            if (payload?.submit) {
+              await sleep(300);
+              // Find enabled button and click
+              const btnRes = await chrome.scripting.executeScript({
+                target: { tabId: targetId },
+                world: 'MAIN',
+                func: async () => {
+                  for (let i = 0; i < 25; i++) {
+                    const btn = document.querySelector("flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成']");
+                    if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                      btn.click(); // Direct click in page context
+                      const r = btn.getBoundingClientRect();
+                      return { found: true, enabled: true, cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2) };
+                    }
+                    await new Promise(r => setTimeout(r, 100));
+                  }
+                  const btn = document.querySelector("flow-prompt-box button.generate-icon-button, button.generate-icon-button, button[aria-label='开始生成']");
+                  if (!btn) return { found: false };
+                  const r = btn.getBoundingClientRect();
+                  return { found: true, enabled: !btn.disabled, cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2) };
+                }
+              });
+              const bInfo = btnRes?.[0]?.result;
+              if (bInfo && bInfo.found) {
+                await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                  type: 'mousePressed', x: bInfo.cx, y: bInfo.cy, button: 'left', clickCount: 1
+                });
+                await sleep(50);
+                await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                  type: 'mouseReleased', x: bInfo.cx, y: bInfo.cy, button: 'left', clickCount: 1
+                });
+              }
+              // Also dispatch Enter
+              await sleep(100);
+              await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+                type: 'rawKeyDown', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter'
+              });
+              await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchKeyEvent', {
+                type: 'keyUp', windowsVirtualKeyCode: 13, code: 'Enter', key: 'Enter'
+              });
             }
             try { await chrome.debugger.detach(debugTarget); } catch (e) {}
             sendToAgent({ id: msg.id, result: { success: true, textLength: payload?.text?.length || 0 } });
@@ -915,7 +1040,7 @@ async function handleAgentCommand(msg) {
                   }],
                   useV2ModelConfig: true
                 };
-                const resp = await window.fetch(`https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartAndEndImage?key=AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY`, {
+                const resp = await window.fetch(`https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartAndEndImage`, {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/json',
@@ -933,8 +1058,135 @@ async function handleAgentCommand(msg) {
                   }
                 };
               }
+              if (act === 'GENERATE_IMAGE_NATIVE') {
+                const { prompt, aspect = 'IMAGE_ASPECT_RATIO_LANDSCAPE', count = 1, refMediaIds = [], model = 'GEM_PIX_2', projectId, seed } = pl;
+                const siteKey = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+                let recaptchaToken = '';
+                if (window.grecaptcha?.enterprise?.execute) {
+                  recaptchaToken = await window.grecaptcha.enterprise.execute(siteKey, { action: 'IMAGE_GENERATION' });
+                } else if (window.grecaptcha?.execute) {
+                  recaptchaToken = await window.grecaptcha.execute(siteKey, { action: 'IMAGE_GENERATION' });
+                }
+                const ts = Date.now();
+                const requests = [];
+                for (let i = 0; i < (count || 1); i++) {
+                  requests.push({
+                    clientContext: {
+                      tool: 'PINHOLE',
+                      userPaygateTier: 'PAYGATE_TIER_ONE',
+                      sessionId: `;${ts}`,
+                      projectId: projectId,
+                    },
+                    seed: seed !== undefined ? ((Number(seed) + i) % 4294967296) : ((ts + i * 1000) % 1000000),
+                    imageModelName: model,
+                    imageAspectRatio: aspect,
+                    structuredPrompt: { parts: [{ text: prompt }] },
+                    imageInputs: (refMediaIds || []).map(mid => ({
+                      name: mid,
+                      imageInputType: 'IMAGE_INPUT_TYPE_REFERENCE'
+                    }))
+                  });
+                }
+                const body = {
+                  clientContext: {
+                    tool: 'PINHOLE',
+                    userPaygateTier: 'PAYGATE_TIER_ONE',
+                    sessionId: `;${ts}`,
+                    projectId: projectId,
+                    recaptchaContext: {
+                      applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB',
+                      token: recaptchaToken
+                    }
+                  },
+                  mediaGenerationContext: { batchId: crypto.randomUUID() },
+                  useNewMedia: true,
+                  requests: requests
+                };
+                const endpoint = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
+                const resp = await window.fetch(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'text/plain;charset=UTF-8',
+                    'authorization': `Bearer ${key}`
+                  },
+                  body: JSON.stringify(body)
+                });
+                const resData = await resp.json().catch(() => ({}));
+                return {
+                  success: true,
+                  result: {
+                    status: resp.status,
+                    ok: resp.ok,
+                    data: resData
+                  }
+                };
+              }
+              if (act === 'GENERATE_R2V_NATIVE') {
+                const { prompt, aspect = 'VIDEO_ASPECT_RATIO_LANDSCAPE', duration = 8, refMediaIds = [], count = 1, projectId, seed } = pl;
+                const siteKey = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
+                let recaptchaToken = '';
+                if (window.grecaptcha?.enterprise?.execute) {
+                  recaptchaToken = await window.grecaptcha.enterprise.execute(siteKey, { action: 'VIDEO_GENERATION' });
+                } else if (window.grecaptcha?.execute) {
+                  recaptchaToken = await window.grecaptcha.execute(siteKey, { action: 'VIDEO_GENERATION' });
+                }
+                const modelKey = `abra_t2v_${duration}s`;
+                const ts = Date.now();
+                const requests = [];
+                for (let i = 0; i < (count || 1); i++) {
+                  requests.push({
+                    aspectRatio: aspect,
+                    videoModelKey: modelKey,
+                    metadata: {},
+                    referenceImages: (refMediaIds || []).map(mid => ({
+                      mediaId: mid,
+                      imageUsageType: 'IMAGE_USAGE_TYPE_ASSET',
+                    })),
+                    seed: seed !== undefined ? ((Number(seed) + i) % 4294967296) : ((ts + i * 1000) % 1000000),
+                    textInput: { structuredPrompt: { parts: [{ text: prompt }] } },
+                  });
+                }
+                const body = {
+                  clientContext: {
+                    tool: 'PINHOLE',
+                    userPaygateTier: 'PAYGATE_TIER_ONE',
+                    sessionId: `;${ts}`,
+                    projectId: projectId,
+                    recaptchaContext: {
+                      applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB',
+                      token: recaptchaToken
+                    }
+                  },
+                  mediaGenerationContext: { batchId: crypto.randomUUID() },
+                  requests: requests,
+                  useV2ModelConfig: true
+                };
+                const endpoint = `https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoReferenceImages`;
+                const resp = await window.fetch(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'text/plain;charset=UTF-8',
+                    'authorization': `Bearer ${key}`
+                  },
+                  body: JSON.stringify(body)
+                });
+                const resData = await resp.json().catch(() => ({}));
+                return {
+                  success: true,
+                  result: {
+                    status: resp.status,
+                    ok: resp.ok,
+                    data: resData
+                  }
+                };
+              }
               if (act === 'PAGE_FETCH') {
-                const { url, options } = pl;
+                const { url, options = {} } = pl;
+                if (!options.headers) options.headers = {};
+                if (options.headers.__attach_flow_key__ || !options.headers['authorization']) {
+                  delete options.headers.__attach_flow_key__;
+                  if (key) options.headers['authorization'] = `Bearer ${key}`;
+                }
                 const resp = await window.fetch(url, options);
                 const contentType = resp.headers.get('content-type') || '';
                 let data;
@@ -978,9 +1230,64 @@ async function handleAgentCommand(msg) {
                   src: el.getAttribute('src') || el.currentSrc || '',
                   alt: el.getAttribute('alt') || '',
                   mediaId: el.getAttribute('data-media-id') || '',
-                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true')
+                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                  rect: { x: Math.round(el.getBoundingClientRect().left), y: Math.round(el.getBoundingClientRect().top), w: Math.round(el.getBoundingClientRect().width), h: Math.round(el.getBoundingClientRect().height) }
                 }));
                 return { success: true, result: els };
+              }
+              if (act === 'CLICK_DOM') {
+                const { selector, icon, textMatch, x, y } = pl || {};
+                let el = null;
+                if (typeof x === 'number' && typeof y === 'number') {
+                  el = document.elementFromPoint(x, y);
+                } else if (selector) {
+                  try { el = document.querySelector(selector); } catch(e) {}
+                }
+                if (!el && icon) {
+                  const icons = Array.from(document.querySelectorAll('mat-icon'));
+                  const matched = icons.find(i => i.textContent?.trim() === icon);
+                  el = matched ? matched.closest('button, [role="button"]') : null;
+                }
+                if (!el && textMatch) {
+                  const all = Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"], span'));
+                  el = all.find(e => (e.innerText || '').includes(textMatch) || (e.getAttribute('aria-label') || '').includes(textMatch));
+                }
+                if (!el) return { success: false, error: 'Element not found' };
+                el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                el.click();
+                return { success: true, text: el.innerText || el.getAttribute('aria-label') };
+              }
+              if (act === 'SELECT_DOWNLOAD_OPTION') {
+                const { resolution = '1080p' } = pl || {};
+                const icons = Array.from(document.querySelectorAll('mat-icon'));
+                const dlIcon = icons.find(i => i.textContent?.trim() === 'download');
+                const dlBtn = dlIcon ? dlIcon.closest('button, [role="button"]') : null;
+                if (!dlBtn) return { success: false, error: 'Download button not found' };
+
+                dlBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                dlBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                dlBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                dlBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                dlBtn.click();
+
+                await new Promise(r => setTimeout(r, 250));
+
+                const menuItems = Array.from(document.querySelectorAll('.cdk-overlay-pane [role="menuitem"], .cdk-overlay-pane button'));
+                const targetItem = menuItems.find(item => (item.innerText || '').includes(resolution));
+                if (!targetItem) {
+                  return { success: false, error: 'Target item not found', available: menuItems.map(m => m.innerText?.trim()) };
+                }
+
+                targetItem.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                targetItem.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                targetItem.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                targetItem.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                targetItem.click();
+
+                return { success: true, clicked: targetItem.innerText?.trim() };
               }
               if (act === 'EXTRACT_MEDIA_URLS') {
                 const vp = document.querySelector('cdk-virtual-scroll-viewport');
@@ -1231,13 +1538,21 @@ async function handleAgentCommand(msg) {
                   let newUrl = url;
                   const ov = window.__flowNextOverride;
                   if (ov && parsed && Array.isArray(parsed.requests) && parsed.requests.length > 0) {
+                    const targetCount = Number(ov.count) || parsed.requests.length;
+                    while (parsed.requests.length < targetCount) {
+                      const cloneReq = JSON.parse(JSON.stringify(parsed.requests[0]));
+                      if (typeof cloneReq.seed === 'number') cloneReq.seed += parsed.requests.length;
+                      parsed.requests.push(cloneReq);
+                    }
+                    const rawRefs = ov.refIds || ov.referenceImageIds || ov.refMediaIds || [];
                     if (ov.type === 'IMAGE' && url.includes('batchGenerateImages')) {
-                      for (const req of parsed.requests) {
+                      for (let reqIdx = 0; reqIdx < parsed.requests.length; reqIdx++) {
+                        const req = parsed.requests[reqIdx];
                         if (ov.prompt) {
                           req.structuredPrompt = { parts: [{ text: ov.prompt }] };
                         }
-                        if (Array.isArray(ov.refIds) && ov.refIds.length > 0) {
-                          req.imageInputs = ov.refIds.map(id => ({
+                        if (Array.isArray(rawRefs) && rawRefs.length > 0) {
+                          req.imageInputs = rawRefs.map(id => ({
                             name: id,
                             imageInputType: 'IMAGE_INPUT_TYPE_REFERENCE'
                           }));
@@ -1249,7 +1564,7 @@ async function handleAgentCommand(msg) {
                           req.imageModelName = ov.modelName;
                         }
                         if (typeof ov.seed === 'number') {
-                          req.seed = ov.seed;
+                          req.seed = ov.seed + reqIdx;
                         }
                       }
                       if (ov.consume !== false) window.__flowNextOverride = null;
@@ -1259,7 +1574,8 @@ async function handleAgentCommand(msg) {
                         const qs = keyMatch ? keyMatch[0] : '';
                         newUrl = `https://aisandbox-pa.googleapis.com${ov.targetEndpoint}${qs}`;
                       }
-                      for (const req of parsed.requests) {
+                      for (let reqIdx = 0; reqIdx < parsed.requests.length; reqIdx++) {
+                        const req = parsed.requests[reqIdx];
                         if (ov.prompt) {
                           req.textInput = { structuredPrompt: { parts: [{ text: ov.prompt }] } };
                         }
@@ -1270,7 +1586,7 @@ async function handleAgentCommand(msg) {
                           req.aspectRatio = ov.aspectRatio;
                         }
                         if (typeof ov.seed === 'number') {
-                          req.seed = ov.seed;
+                          req.seed = ov.seed + reqIdx;
                         }
                         if (ov.startImageId) {
                           req.startImage = { mediaId: ov.startImageId };
@@ -1278,8 +1594,8 @@ async function handleAgentCommand(msg) {
                         if (ov.clearEndImage) {
                           delete req.endImage;
                         }
-                        if (Array.isArray(ov.referenceImageIds) && ov.referenceImageIds.length > 0) {
-                          req.referenceImages = ov.referenceImageIds.map(id => ({
+                        if (Array.isArray(rawRefs) && rawRefs.length > 0) {
+                          req.referenceImages = rawRefs.map(id => ({
                             mediaId: id,
                             imageUsageType: 'IMAGE_USAGE_TYPE_ASSET'
                           }));
@@ -1419,6 +1735,11 @@ async function handleAgentCommand(msg) {
                 el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: text || '' }));
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 return { success: true, result: { typedLength: (el.innerText || '').length, preview: (el.innerText || '').slice(0, 80) } };
+              }
+              if (act === 'EVAL_JS') {
+                const fn = new Function('key', 'payload', `return (async () => { ${pl?.code || ''} })();`);
+                const res = await fn(key, pl);
+                return { success: true, result: res };
               }
               return { success: false, error: `Unknown action: ${act}` };
             } catch (err) {
@@ -2240,21 +2561,7 @@ async function handleApiRequest(msg) {
           }
         }
 
-        // Dispatch trusted CDP mouse movement before reCAPTCHA execution
-        try {
-          if (chrome.debugger) {
-            const dbg = { tabId: targetTabId };
-            try { await chrome.debugger.attach(dbg, '1.3'); } catch (e) {}
-            const pts = [[320, 260], [380, 290], [450, 310], [510, 280]];
-            for (const [px, py] of pts) {
-              await chrome.debugger.sendCommand(dbg, 'Input.dispatchMouseEvent', {
-                type: 'mouseMoved', x: px + Math.floor(Math.random() * 15), y: py + Math.floor(Math.random() * 15), button: 'none'
-              });
-              await sleep(20);
-            }
-            try { await chrome.debugger.detach(dbg); } catch (e) {}
-          }
-        } catch (e) {}
+        // CDP debugger attach disabled to prevent triggering Google reCAPTCHA UNUSUAL_ACTIVITY
 
         const inPageHeaders = { ...(headers || {}) };
         inPageHeaders['authorization'] = `Bearer ${activeFlowKey}`;
@@ -2290,10 +2597,10 @@ async function handleApiRequest(msg) {
                 return { captchaError: 'Timeout waiting for grecaptcha in page' };
               }
 
-              const solveToken = () => new Promise((resolve, reject) => {
-                const timer = setTimeout(() => reject(new Error('captcha_timeout')), 25000);
+              const execCaptcha = (act) => new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('captcha_timeout')), 15000);
                 try {
-                  window.grecaptcha.enterprise.execute(websiteKey, { action: actionName })
+                  window.grecaptcha.enterprise.execute(websiteKey, act ? { action: act } : undefined)
                     .then((tok) => {
                       clearTimeout(timer);
                       resolve(tok);
@@ -2310,9 +2617,17 @@ async function handleApiRequest(msg) {
 
               let token;
               try {
-                token = await solveToken();
-              } catch (err) {
-                return { captchaError: err?.message || 'reCAPTCHA execution failed' };
+                token = await execCaptcha(actionName);
+              } catch (e1) {
+                try {
+                  token = await execCaptcha('IMAGE_GENERATION');
+                } catch (e2) {
+                  try {
+                    token = await execCaptcha(null);
+                  } catch (e3) {
+                    return { captchaError: e1?.message || e3?.message || 'reCAPTCHA execution failed' };
+                  }
+                }
               }
               if (!token) {
                 return { captchaError: 'Empty reCAPTCHA token returned' };
