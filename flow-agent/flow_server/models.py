@@ -38,7 +38,9 @@ class VideoGenerationRequest(BaseModel):
     ref_media_ids: Optional[List[str]] = Field(None, description="Optional reference image media IDs (up to 10)")
     start_media_id: Optional[str] = Field(None, description="Optional pre-uploaded start image or video media ID")
     end_media_id: Optional[str] = Field(None, description="Optional pre-uploaded end image media ID (requires start_media_id or image_base64)")
+    extend_media_id: Optional[str] = Field(None, description="Optional source video media ID to extend/continue by another 8s")
     is_video: Optional[bool] = Field(False, description="True if the pre-uploaded reference is a video")
+    is_extend: Optional[bool] = Field(False, description="True if extending/continuing an existing video")
     seed: Optional[int] = Field(None, ge=0, le=4294967295, description="Optional explicit generation seed")
     video_model: Optional[str] = Field(None, description="Optional Flow videoModelKey override")
     project_id: Optional[str] = Field(None, description="Optional target Flow project ID override")
@@ -50,6 +52,15 @@ class VideoGenerationRequest(BaseModel):
             "the same step behind the Flow UI's high-resolution download."
         ),
     )
+
+
+class CharacterCreateRequest(BaseModel):
+    name: str = Field(..., description="Display name for the character")
+    project_id: Optional[str] = Field(None, description="Target Flow project ID")
+    face_media_id: Optional[str] = Field(None, description="Optional media ID or workflow ID for face reference")
+    body_media_id: Optional[str] = Field(None, description="Optional media ID or workflow ID for body reference")
+    voice: Optional[str] = Field(None, description="Optional preset voice name (e.g. Charon)")
+    personality: Optional[str] = Field(None, description="Optional personality notes")
 
 
 class VideoUpsampleRequest(BaseModel):

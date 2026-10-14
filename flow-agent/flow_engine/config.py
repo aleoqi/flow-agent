@@ -116,12 +116,17 @@ ENDPOINTS = {
     "generate_fl": "/v1/video:batchAsyncGenerateVideoStartAndEndImage",
     "generate_r2v": "/v1/video:batchAsyncGenerateVideoReferenceImages",
     "generate_edit": "/v1/video:batchAsyncGenerateVideoEditVideo",
+    "generate_extend": "/v1/video:batchAsyncGenerateVideoExtendVideo",
     "upload_image": "/v1/flow/uploadImage",
     "upsample_image": "/v1/flow/upsampleImage",
     "upsample_video": "/v1/video:batchAsyncGenerateVideoUpsampleVideo",
     "poll_status": "/v1/video:batchCheckAsyncVideoGenerationStatus",
     "get_media": "/v1/media/{media_id}",
     "get_credits": "/v1/credits",
+    "trpc_create_entity": "https://labs.google/fx/api/trpc/flow.createEntity",
+    "trpc_delete_entity": "https://labs.google/fx/api/trpc/flow.deleteEntities",
+    "trpc_initial_data": "https://labs.google/fx/api/trpc/flow.projectInitialData",
+    "patch_entities": "/v1/projects/{project_id}/flow/entities",
 }
 
 MODELS = {

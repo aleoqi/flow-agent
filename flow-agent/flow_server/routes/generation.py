@@ -830,11 +830,11 @@ async def _generate_video(req: VideoGenerationRequest, x_client_id: Optional[str
     aspect_key = ASPECTS.get(req.aspect, "VIDEO_ASPECT_RATIO_PORTRAIT")
 
     from flow_engine.generators.common import poll_status, download_video
-    image_media_id = req.start_media_id
+    image_media_id = req.extend_media_id or req.start_media_id
     end_media_id = req.end_media_id
     ref_media_ids = list(req.ref_media_ids or [])
     temp_img_path = None
-    is_video_input = bool(req.is_video)
+    is_video_input = bool(req.is_video or req.is_extend or req.extend_media_id)
 
     try:
         if image_media_id:
@@ -950,7 +950,18 @@ async def _generate_video(req: VideoGenerationRequest, x_client_id: Optional[str
 
     try:
         # Submit generation
-        if is_video_input and image_media_id:
+        if req.extend_media_id or (getattr(req, "is_extend", False) and image_media_id):
+            from flow_engine.generators.extend import extend_video
+            source_vid = req.extend_media_id or image_media_id
+            media_ids = await extend_video(
+                active_bridge,
+                req.prompt,
+                aspect_key,
+                project_id,
+                source_vid,
+                seed=req.seed,
+            )
+        elif is_video_input and image_media_id:
             from flow_engine.generators.v2v import edit_video
             media_ids = await edit_video(active_bridge, req.prompt, aspect_key, project_id, image_media_id, duration=req.duration, ref_media_ids=ref_media_ids or None)
         elif image_media_id and end_media_id:

@@ -556,6 +556,32 @@ class ExtensionBridge:
             self._pending.pop(req_id, None)
         return None
 
+    async def trpc_request(self, url: str, body: dict = None, method: str = "POST", client_id: str | None = None, timeout: float = 30) -> dict | None:
+        """Send a tRPC request to labs.google via the Chrome extension."""
+        client_id = client_id or target_client_id_var.get() or self._select_client()
+        if not client_id:
+            return {"error": "No extensions connected"}
+        req_id = str(uuid.uuid4())
+        future = self._loop.create_future()
+        self._pending[req_id] = future
+        sent = await self.send_message_to(client_id, {
+            "id": req_id,
+            "method": "trpc_request",
+            "params": {"url": url, "body": body, "method": method}
+        })
+        if not sent:
+            self._pending.pop(req_id, None)
+            return {"error": f"Failed to send trpc_request to client {client_id}"}
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            log.warning("Timed out on tRPC request %s", url)
+            return {"error": "TRPC_TIMEOUT"}
+        finally:
+            self._pending.pop(req_id, None)
+
+
     async def eval_tab(
         self,
         url_pattern: str = "flow.google.com/project",

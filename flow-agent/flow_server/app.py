@@ -9,13 +9,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from flow_server.state import lifespan
-from flow_server.routes import system, generation, chat, media
+from flow_server.routes import system, generation, chat, media, character
 from flow_server.mcp import sse as mcp_sse
 
 app = FastAPI(
     title="Google Flow Agent API",
     description="OpenAI-compatible endpoints for Google Flow media generation.",
-    version="2.0.7",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -32,6 +32,7 @@ app.add_middleware(
 # parameterised routes and neither collides), so resolution is unchanged.
 app.include_router(system.router)
 app.include_router(generation.router)
+app.include_router(character.router)
 app.include_router(chat.router)
 app.include_router(media.router)
 app.include_router(mcp_sse.router)

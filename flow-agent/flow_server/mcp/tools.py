@@ -237,5 +237,110 @@ def get_mcp_tools_list():
                 },
                 "required": ["prompt"]
             }
+        },
+        {
+            "name": "extend_flow_video",
+            "description": "Extend an existing Flow video clip by 7 seconds using Google Veo 3.1 extension lite (POST /v1/video:batchAsyncGenerateVideoExtendVideo). Seamlessly continues motion from the end of the input video.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Description of the continuation motion or events"
+                    },
+                    "media_id": {
+                        "type": "string",
+                        "description": "Media ID of an existing Flow video to extend"
+                    },
+                    "video_path": {
+                        "type": "string",
+                        "description": "Optional local video file path; automatically uploaded if media_id is not provided"
+                    },
+                    "aspect": {
+                        "type": "string",
+                        "enum": ["landscape", "portrait"],
+                        "default": "landscape",
+                        "description": "Video aspect ratio (default: landscape)"
+                    },
+                    "ref_media_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": "Optional reference media IDs to maintain visual consistency"
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4294967295,
+                        "description": "Optional explicit generation seed"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        },
+        {
+            "name": "list_flow_characters",
+            "description": "List native Character entities in the current Flow project (with voice, personality, workflows, and prompts).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional Flow project ID. Defaults to active project."
+                    }
+                }
+            }
+        },
+        {
+            "name": "create_flow_character",
+            "description": "Create a native Character entity in Google Flow with name, face/body references, voice, and personality guidelines.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Character display name (e.g. 'Elena', 'Chen')"
+                    },
+                    "face_media_id": {
+                        "type": "string",
+                        "description": "Workflow or media ID representing character face reference"
+                    },
+                    "body_media_id": {
+                        "type": "string",
+                        "description": "Workflow or media ID representing character body / costume reference"
+                    },
+                    "voice": {
+                        "type": "string",
+                        "description": "TTS voice name (e.g. 'Puck', 'Charon', 'Aoede')"
+                    },
+                    "personality": {
+                        "type": "string",
+                        "description": "Character personality description"
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional Flow project ID. Defaults to active project."
+                    }
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "delete_flow_character",
+            "description": "Delete a native Character entity from the current Flow project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Character entity ID to delete"
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional Flow project ID. Defaults to active project."
+                    }
+                },
+                "required": ["entity_id"]
+            }
         }
     ]

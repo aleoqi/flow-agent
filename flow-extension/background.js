@@ -639,10 +639,30 @@ async function handleAgentCommand(msg) {
           return;
         }
 
+        if (action === 'DOWNLOAD_FILE') {
+          try {
+            const { url, filename } = payload;
+            const dlId = await chrome.downloads.download({
+              url,
+              filename: filename || 'flow_video.mp4',
+              conflictAction: 'overwrite',
+              saveAs: false
+            });
+            sendToAgent({ id: msg.id, result: { success: true, result: { downloadId: dlId } } });
+            return;
+          } catch (dlErr) {
+            sendToAgent({ id: msg.id, result: { success: false, error: dlErr.message } });
+            return;
+          }
+        }
+
         if (action === 'FETCH_BASE64') {
           try {
-            const resp = await fetch(payload.url, { credentials: 'include', redirect: 'follow' });
-            if (resp.ok) {
+            let resp = await fetch(payload.url, { redirect: 'follow' }).catch(() => null);
+            if (!resp || !resp.ok) {
+              resp = await fetch(payload.url, { credentials: 'include', redirect: 'follow' }).catch(() => null);
+            }
+            if (resp && resp.ok) {
               const finalUrl = resp.url;
               const contentType = resp.headers.get('content-type') || '';
               const buf = await resp.arrayBuffer();
@@ -813,11 +833,7 @@ async function handleAgentCommand(msg) {
           world: 'MAIN',
           func: async (act, pl, key) => {
             try {
-              try {
-                delete document.visibilityState;
-                delete document.hidden;
-                delete document.hasFocus;
-              } catch (e) {}
+              // Keep DOM and document properties 100% native
               if (act === 'GET_PAGE_INFO') {
                 const buttons = Array.from(document.querySelectorAll('button, div[role="button"]')).map(b => ({
                   text: b.innerText?.trim()?.slice(0, 50),
@@ -2249,9 +2265,6 @@ async function handleApiRequest(msg) {
           func: async ({ websiteKey, actionName, payload, waitTimeoutMs, reqUrl, reqMethod, reqHeaders }) => {
             try {
               try {
-                delete document.visibilityState;
-                delete document.hidden;
-                delete document.hasFocus;
                 window.focus();
               } catch (e) {}
 

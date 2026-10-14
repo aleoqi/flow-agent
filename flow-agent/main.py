@@ -621,6 +621,7 @@ def cmd_video(argv):
     parser.add_argument("--duration", "-d", type=int, choices=[4, 6, 8, 10], default=10)
     parser.add_argument("--count", "-c", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument("--edit", "-e", metavar="MEDIA_ID", help="Edit an existing video media ID")
+    parser.add_argument("--extend", metavar="MEDIA_ID", help="Extend an existing video by 7s (Veo 3.1 lite)")
     parser.add_argument("--start", "-s", metavar="IMAGE", help="Start image path or media ID")
     parser.add_argument("--end", metavar="IMAGE", help="End image path or media ID (use with --start)")
     parser.add_argument("--ref", "-r", nargs="+", metavar="IMAGE", help="Reference image paths or media IDs")
@@ -643,9 +644,9 @@ def cmd_video(argv):
 
     if args.end and not args.start:
         parser.error("--end requires --start")
-    modes = sum(bool(value) for value in (args.edit, args.start or args.end, args.ref))
+    modes = sum(bool(value) for value in (args.edit, args.extend, args.start or args.end, args.ref))
     if modes > 1:
-        parser.error("use only one of --edit, --start, or --ref")
+        parser.error("use only one of --edit, --extend, --start, or --ref")
 
     _wait_for_generation_ready()
     output_path, explicit_output = _requested_output_path(args.output, "video.mp4")
@@ -659,7 +660,9 @@ def cmd_video(argv):
         payload["project_id"] = args.project_id
     if args.resolution != "720p":
         payload["resolution"] = args.resolution
-    if args.edit:
+    if args.extend:
+        payload.update({"extend_media_id": args.extend, "is_extend": True, "duration": 7})
+    elif args.edit:
         payload.update({"start_media_id": args.edit, "is_video": True})
     elif args.start:
         if os.path.isfile(args.start):
@@ -921,13 +924,135 @@ def cmd_agent(argv):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def cmd_extend(argv):
+    parser = argparse.ArgumentParser(
+        prog="flow extend",
+        description="Extend an existing Flow video by 7s using Google Veo 3.1 extension lite.",
+    )
+    parser.add_argument("media_id", help="Flow video media ID to extend")
+    parser.add_argument("prompt", help="Continuation motion or narrative prompt")
+    parser.add_argument("--output", "-o", default=None, help="Exact output file path")
+    parser.add_argument("--aspect", "-a", choices=["portrait", "landscape"], default="landscape")
+    parser.add_argument("--ref", "-r", nargs="+", metavar="IMAGE", help="Reference image paths or media IDs")
+    parser.add_argument("--project-id", "-p", default=None, help="Target Flow project ID")
+    parser.add_argument("--client", default=None, help="Target Flow extension client ID")
+    parser.add_argument("--idempotency-key", help="Reuse a previous paid request safely")
+    args = parser.parse_args(argv)
+
+    forwarded = [
+        args.prompt,
+        "--extend",
+        args.media_id,
+        "--aspect",
+        args.aspect,
+    ]
+    if args.output:
+        forwarded.extend(["--output", args.output])
+    if args.ref:
+        forwarded.extend(["--ref"] + args.ref)
+    if args.project_id:
+        forwarded.extend(["--project-id", args.project_id])
+    if args.client:
+        forwarded.extend(["--client", args.client])
+    if args.idempotency_key:
+        forwarded.extend(["--idempotency-key", args.idempotency_key])
+    cmd_video(forwarded)
+
+
+def cmd_character(argv):
+    parser = argparse.ArgumentParser(
+        prog="flow character",
+        description="Manage native Flow Character entities (list, create, show, rm).",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Character subcommand")
+
+    # list
+    p_list = subparsers.add_parser("list", help="List characters in the Flow project")
+    p_list.add_argument("--project-id", "-p", default=None, help="Flow project ID")
+    p_list.add_argument("--client", default=None, help="Target Flow extension client ID")
+
+    # create
+    p_create = subparsers.add_parser("create", help="Create a new native character entity")
+    p_create.add_argument("name", help="Character display name (e.g. 'Elena', 'Chen')")
+    p_create.add_argument("--face", help="Face reference media ID or workflow ID")
+    p_create.add_argument("--body", help="Body/outfit reference media ID or workflow ID")
+    p_create.add_argument("--voice", help="TTS voice name (e.g. 'Puck', 'Charon', 'Aoede')")
+    p_create.add_argument("--personality", help="Character personality guidelines")
+    p_create.add_argument("--project-id", "-p", default=None, help="Flow project ID")
+    p_create.add_argument("--client", default=None, help="Target Flow extension client ID")
+
+    # show
+    p_show = subparsers.add_parser("show", help="Show character details")
+    p_show.add_argument("entity_id", help="Character entity ID")
+    p_show.add_argument("--project-id", "-p", default=None, help="Flow project ID")
+    p_show.add_argument("--client", default=None, help="Target Flow extension client ID")
+
+    # rm
+    p_rm = subparsers.add_parser("rm", help="Delete a character entity")
+    p_rm.add_argument("entity_id", help="Character entity ID")
+    p_rm.add_argument("--project-id", "-p", default=None, help="Flow project ID")
+    p_rm.add_argument("--client", default=None, help="Target Flow extension client ID")
+
+    args = parser.parse_args(argv)
+    if not args.subcommand:
+        parser.print_help()
+        return
+
+    _ensure_backend()
+    headers = {}
+    if getattr(args, "client", None):
+        headers["X-Client-Id"] = args.client
+
+    if args.subcommand == "list":
+        path = "/v1/characters"
+        if args.project_id:
+            path += f"?project_id={args.project_id}"
+        res, _ = _request_json(path, method="GET", headers=headers)
+        chars = res.get("characters", [])
+        print(f"Characters in project ({len(chars)}):")
+        for c in chars:
+            eid = c.get("entityId") or c.get("id") or "unknown"
+            info = c.get("characterInfo") or {}
+            name = info.get("displayName") or c.get("name") or "Unnamed"
+            voice = info.get("voice") or "-"
+            print(f"  • [{eid}] {name} (voice: {voice})")
+
+    elif args.subcommand == "create":
+        payload = {
+            "name": args.name,
+            "face_media_id": args.face,
+            "body_media_id": args.body,
+            "voice": args.voice,
+            "personality": args.personality,
+            "project_id": args.project_id,
+        }
+        res, _ = _request_json("/v1/characters", method="POST", payload=payload, headers=headers)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+
+    elif args.subcommand == "show":
+        path = f"/v1/characters/{args.entity_id}"
+        if args.project_id:
+            path += f"?project_id={args.project_id}"
+        res, _ = _request_json(path, method="GET", headers=headers)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+
+    elif args.subcommand == "rm":
+        path = f"/v1/characters/{args.entity_id}"
+        if args.project_id:
+            path += f"?project_id={args.project_id}"
+        res, _ = _request_json(path, method="DELETE", headers=headers)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
 COMMANDS = {
     "mcp": run_mcp,
     "image": cmd_image,
     "batch": cmd_batch,
     "video": cmd_video,
+    "extend": cmd_extend,
     "upsample": cmd_upsample,
     "edit": cmd_edit,
+    "character": cmd_character,
     "upload": cmd_upload,
     "credits": cmd_credits,
     "status": cmd_status,
@@ -945,6 +1070,8 @@ def _usage():
     print("  image      Generate images")
     print("  batch      Generate batch images in parallel")
     print("  video      Generate videos")
+    print("  extend     Extend an existing video by 7s (Veo 3.1 lite)")
+    print("  character  Manage native Flow Character entities (list, create, show, rm)")
     print("  upsample   Upsample a video to 1080p or 4k")
     print("  edit       Edit a video")
     print("  upload     Upload media")

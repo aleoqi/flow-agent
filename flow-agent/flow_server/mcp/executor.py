@@ -19,7 +19,12 @@ from fastapi import HTTPException
 
 from flow_server.config import OUTPUT_DIR, _normalise_model
 from flow_server.media_types import extension_for_media, sniff_media_type
-from flow_server.models import ImageGenerationRequest, VideoGenerationRequest, VideoUpsampleRequest
+from flow_server.models import (
+    ImageGenerationRequest,
+    VideoGenerationRequest,
+    VideoUpsampleRequest,
+    CharacterCreateRequest,
+)
 from flow_server.mcp.helpers import _mcp_error, _mcp_upload_local_file, _mcp_download_url
 from flow_server.routes.system import health, list_models, get_flow_credits
 from flow_server.routes.media import get_history
@@ -27,6 +32,11 @@ from flow_server.routes.generation import (
     openai_generate_image,
     openai_generate_video,
     openai_upsample_video,
+)
+from flow_server.routes.character import (
+    api_list_characters,
+    api_create_character,
+    api_delete_character,
 )
 
 log = logging.getLogger("flow_engine.openai_api")
@@ -335,6 +345,77 @@ async def execute_mcp_tool(request_id, tool_name, arguments):
                 wait_seconds=wait_seconds,
                 auto_reset_mode=auto_reset_mode,
                 client_id=client_id,
+            )
+            text = json.dumps(res, ensure_ascii=False, indent=2)
+
+        elif tool_name == "extend_flow_video":
+            prompt = str(arguments.get("prompt") or "").strip()
+            if not prompt:
+                return _mcp_error(request_id, -32602, "Error: 'prompt' is required and cannot be empty.")
+
+            media_id = arguments.get("media_id")
+            if not media_id:
+                video_path = arguments.get("video_path")
+                if not video_path:
+                    return _mcp_error(request_id, -32602, "Error: provide 'media_id' or 'video_path' to extend.")
+                try:
+                    media_id = await _mcp_upload_local_file(video_path)
+                except Exception as e:
+                    return _mcp_error(request_id, -32602, f"Source video upload failed: {str(e)}")
+
+            seed_val = arguments.get("seed")
+            req = VideoGenerationRequest(
+                prompt=prompt,
+                aspect=arguments.get("aspect", "landscape"),
+                n=1,
+                duration=7,
+                extend_media_id=media_id,
+                is_extend=True,
+                ref_media_ids=(list(arguments.get("ref_media_ids") or [])[:10] or None),
+                seed=int(seed_val) if seed_val is not None else None,
+            )
+
+            res = await openai_generate_video(req, x_client_id=None)
+            data = res.get("data", [])
+            if not data:
+                text = "No extended video returned by Flow Agent."
+            else:
+                urls = [item.get("url") for item in data if item.get("url")]
+                media_ids = [item.get("media_id") for item in data if item.get("media_id")]
+                text = (f"Success! Extended video by 7 seconds."
+                        + ("\nURLs:\n" + "\n".join(urls) if urls else "")
+                        + ("\nMedia IDs: " + ", ".join(media_ids) if media_ids else ""))
+                if res.get("note"):
+                    text += "\nNote: " + res["note"]
+
+        elif tool_name == "list_flow_characters":
+            project_id = arguments.get("project_id")
+            res = await api_list_characters(project_id=project_id, x_client_id=None)
+            text = json.dumps(res, ensure_ascii=False, indent=2)
+
+        elif tool_name == "create_flow_character":
+            name = str(arguments.get("name") or "").strip()
+            if not name:
+                return _mcp_error(request_id, -32602, "Error: 'name' is required.")
+            req = CharacterCreateRequest(
+                name=name,
+                face_media_id=arguments.get("face_media_id"),
+                body_media_id=arguments.get("body_media_id"),
+                voice=arguments.get("voice"),
+                personality=arguments.get("personality"),
+                project_id=arguments.get("project_id"),
+            )
+            res = await api_create_character(req, x_client_id=None)
+            text = json.dumps(res, ensure_ascii=False, indent=2)
+
+        elif tool_name == "delete_flow_character":
+            entity_id = str(arguments.get("entity_id") or "").strip()
+            if not entity_id:
+                return _mcp_error(request_id, -32602, "Error: 'entity_id' is required.")
+            res = await api_delete_character(
+                entity_id=entity_id,
+                project_id=arguments.get("project_id"),
+                x_client_id=None
             )
             text = json.dumps(res, ensure_ascii=False, indent=2)
 

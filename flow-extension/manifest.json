@@ -18,7 +18,8 @@
     "scripting",
     "declarativeNetRequest",
     "sidePanel",
-    "debugger"
+    "debugger",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>",
