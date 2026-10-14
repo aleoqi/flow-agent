@@ -157,7 +157,7 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
             err = err.get("error", {}).get("message", result.get("error", "Unknown"))
         err_msg = f"{err}{reason}"
         upper_err = err_msg.upper()
-        if status == 403 or any(k in upper_err for k in ("PUBLIC_ERROR_UNUSUAL_ACTIVITY", "UNUSUAL_ACTIVITY", "RECAPTCHA", "403")):
+        if status != 200:
             from ..canvas_driver import canvas_generate_image
             log.warning(
                 "Track 1 REST T2I failed (%s: %s) — falling back to Track 2 Canvas UI!",

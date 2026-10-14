@@ -1978,9 +1978,6 @@ async function _solveCaptchaInternal(requestId, captchaAction) {
           };
           try {
             try {
-              delete document.visibilityState;
-              delete document.hidden;
-              delete document.hasFocus;
               window.focus();
             } catch (e) {}
 

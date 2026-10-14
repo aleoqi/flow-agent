@@ -278,6 +278,7 @@ async def generate_video_r2v(bridge, prompt: str, aspect: str, project_id: str,
     status = result.get("status", 0)
     if status != 200:
         err = result.get("data", {})
+        raise ValueError(f"Track 1 REST R2V Raw Result: status={status}, result={result}")
         reason = ""
         if isinstance(err, dict):
             details = err.get("error", {}).get("details", [])

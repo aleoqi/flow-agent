@@ -507,6 +507,7 @@ def cmd_image(argv):
     )
     parser.add_argument("--project-id", "-p", default=None, help="Target Flow project ID")
     parser.add_argument("--client", default=None, help="Target Flow extension client ID")
+    parser.add_argument("--force-upload", action="store_true", help="Force direct upload without caching")
     parser.add_argument("--idempotency-key", help="Reuse a previous paid request safely")
     args = parser.parse_args(argv)
 
@@ -534,7 +535,7 @@ def cmd_image(argv):
     media_ids = []
     for ref in args.ref or []:
         if os.path.isfile(ref):
-            uploaded = _upload_one(ref)
+            uploaded = _upload_one(ref, force_upload=args.force_upload, client=args.client, project_id=args.project_id)
             media_ids.append(uploaded["media_id"])
         else:
             media_ids.append(ref)
@@ -560,7 +561,7 @@ def _get_file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _lookup_cached_media_id(fingerprint: str) -> str | None:
+def _lookup_cached_media_id(fingerprint: str, project_id: str | None = None) -> str | None:
     """Check local history registries for a matching SHA-256 fingerprint."""
     history_candidates = [
         os.path.abspath(os.path.expanduser(os.environ.get("FLOW_HISTORY_FILE", ""))),
@@ -574,6 +575,8 @@ def _lookup_cached_media_id(fingerprint: str) -> str | None:
                     data = json.load(f)
                 for item in data.get("history", []):
                     if item.get("fingerprint") == fingerprint and item.get("media_id"):
+                        if project_id and item.get("project_id") and item.get("project_id") != project_id:
+                            continue
                         return str(item["media_id"]).strip()
             except Exception:
                 pass
@@ -583,7 +586,7 @@ def _lookup_cached_media_id(fingerprint: str) -> str | None:
 def _upload_one(path, force_upload=False, client=None, project_id=None):
     if not force_upload and os.path.isfile(path):
         fp = _get_file_sha256(path)
-        cached_id = _lookup_cached_media_id(fp)
+        cached_id = _lookup_cached_media_id(fp, project_id=project_id)
         if cached_id:
             return {"media_id": cached_id, "cached": True}
 

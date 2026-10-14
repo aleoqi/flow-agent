@@ -246,21 +246,20 @@ class ExtensionBridge:
 
     async def send_message_to(self, client_id, msg):
         """Send message to a specific client in the pool."""
+        ws = self._clients.get(client_id)
+        if ws and self._is_ws_alive(ws):
+            try:
+                if hasattr(ws, "send_text"):
+                    await ws.send_text(json.dumps(msg))
+                else:
+                    await ws.send(json.dumps(msg))
+                return True
+            except Exception as e:
+                log.warning("Failed to send WebSocket message to client %s: %s", client_id, e)
         if client_id == "__http__" or self.http_registry.is_connected(client_id):
             return self.http_registry.enqueue(None if client_id == "__http__" else client_id, msg)
-        ws = self._clients.get(client_id)
-        if not ws:
-            log.warning("Client %s not connected", client_id)
-            return False
-        try:
-            if hasattr(ws, "send_text"):
-                await ws.send_text(json.dumps(msg))
-            else:
-                await ws.send(json.dumps(msg))
-            return True
-        except Exception as e:
-            log.warning("Failed to send message to client %s: %s", client_id, e)
-            return False
+        log.warning("Client %s not connected", client_id)
+        return False
 
     async def send_message(self, msg):
         """Broadcast message to all connected clients (legacy fallback)."""
