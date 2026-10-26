@@ -65,6 +65,29 @@ async def poll_status(bridge, media_id: str, project_id: str) -> bool:
     start = time.time()
 
     while time.time() - start < POLL_TIMEOUT:
+        # Track 0: Official same-origin batchexecute RPC (as29s)
+        try:
+            from .. import batchexecute
+            freq = batchexecute.media_request(media_id)
+            rpc_res = await bridge.batch_rpc(
+                rpcid=batchexecute.RPC_MEDIA,
+                freq=freq,
+                timeout=30.0,
+            )
+            if rpc_res.get("status") == 200:
+                raw_media = rpc_res.get("data", "")
+                payload = batchexecute.first_payload(raw_media, batchexecute.RPC_MEDIA)
+                urls = batchexecute.read_media_urls(payload, media_id)
+                if urls.video:
+                    elapsed = int(time.time() - start)
+                    log.info("Video ready via batchexecute as29s! (%ds) URL=%s...", elapsed, urls.video[:60])
+                    if not hasattr(bridge, "_cached_video_urls"):
+                        bridge._cached_video_urls = {}
+                    bridge._cached_video_urls[media_id] = urls.video
+                    return True
+        except Exception:
+            pass
+
         result = await bridge.api_request(ENDPOINTS["poll_status"], body, captcha_action="")
         data = result.get("data", {})
         media = data.get("media", [])
@@ -91,6 +114,31 @@ async def poll_status(bridge, media_id: str, project_id: str) -> bool:
 
 async def download_video(bridge, media_id: str, output_path: str) -> bool:
     """Download video from Google's signed URL, with legacy API fallback."""
+    signed_url = None
+    if hasattr(bridge, "_cached_video_urls") and media_id in bridge._cached_video_urls:
+        signed_url = bridge._cached_video_urls[media_id]
+    if not signed_url:
+        try:
+            from .. import batchexecute
+            freq = batchexecute.media_request(media_id)
+            rpc_res = await bridge.batch_rpc(rpcid=batchexecute.RPC_MEDIA, freq=freq, timeout=30.0)
+            if rpc_res.get("status") == 200:
+                payload = batchexecute.first_payload(rpc_res.get("data", ""), batchexecute.RPC_MEDIA)
+                urls = batchexecute.read_media_urls(payload, media_id)
+                if urls.video:
+                    signed_url = urls.video
+        except Exception:
+            pass
+    if signed_url:
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(signed_url, output_path)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                log.info("Video downloaded via official CDN stream to %s (%d bytes)", output_path, os.path.getsize(output_path))
+                return True
+        except Exception as e:
+            log.warning("Stream download from CDN failed (%s), trying request_media_url...", e)
+
     signed_url = await bridge.request_media_url(media_id)
     if signed_url:
         if "/asb/" in signed_url:

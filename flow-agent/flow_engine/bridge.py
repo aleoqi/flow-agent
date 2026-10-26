@@ -64,6 +64,7 @@ class ExtensionBridge:
         self._http_server = None
         self._callback_secret = secrets.token_urlsafe(32)
         self.http_registry = ExtensionHttpRegistry(session_ttl_sec=session_ttl_sec)
+        self._last_flow_tab_request_at: dict[str, float] = {}
 
     def is_extension_connected(self) -> bool:
         return bool(self._clients) or self.http_registry.has_online_session()
@@ -377,6 +378,12 @@ class ExtensionBridge:
             return
         if self._tokens.get(client_id):
             return
+        now = _time.monotonic()
+        last_req = self._last_flow_tab_request_at.get(str(client_id), 0.0)
+        if now - last_req < 120.0:
+            log.debug("Skipping flow tab request for %s (cooldown active: %.1fs remaining)", client_id, 120.0 - (now - last_req))
+            return
+        self._last_flow_tab_request_at[str(client_id)] = now
         try:
             log.info("Requesting client %s to open/refresh Flow tab...", client_id)
             await self.send_message_to(client_id, {"method": "open_flow_tab"})
@@ -406,9 +413,10 @@ class ExtensionBridge:
             await self._request_flow_tab_for(cid)
 
     async def health_check(self):
-        """Quick check if at least one extension is ready with valid token."""
-        active_clients = [cid for cid in self._clients if self._tokens.get(cid)]
-        return bool(active_clients or (self.http_registry.has_online_session() and self.http_registry.get_flow_key()))
+        """Quick check if at least one extension is ready with valid token or canvas session."""
+        if any(self._tokens.values()) or (self.http_registry.has_online_session() and self.http_registry.get_flow_key()):
+            return True
+        return self.is_extension_connected()
 
     async def _on_connect(self, ws):
         """Handle raw WebSocket connections."""
@@ -656,6 +664,49 @@ class ExtensionBridge:
         if remaining > 0:
             log.info("Startup cooldown: waiting %.1fs before first request...", remaining)
             await asyncio.sleep(remaining)
+
+
+    async def batch_rpc(
+        self,
+        rpcid: str,
+        freq: str,
+        captcha_action: str | None = None,
+        timeout: float = 60.0,
+        client_id: str | None = None,
+    ) -> dict:
+        """Send a batchexecute RPC request through the Chrome extension."""
+        target_client = client_id or target_client_id_var.get() or self._select_client()
+        if not target_client:
+            return {"error": "No extensions connected"}
+
+        req_id = str(uuid.uuid4())
+        future = self._loop.create_future()
+        self._pending[req_id] = future
+
+        msg = {
+            "id": req_id,
+            "method": "batch_rpc",
+            "params": {
+                "rpcid": rpcid,
+                "freq": freq,
+                "captchaAction": captcha_action,
+            },
+        }
+
+        sent = await self.send_message_to(target_client, msg)
+        if not sent:
+            self._pending.pop(req_id, None)
+            return {"error": f"Failed to send batch_rpc to client {target_client}"}
+
+        try:
+            res = await asyncio.wait_for(future, timeout=timeout)
+            if isinstance(res, dict):
+                res["_client_id"] = target_client
+            return res
+        except asyncio.TimeoutError:
+            return {"error": "TIMEOUT", "_client_id": target_client}
+        finally:
+            self._pending.pop(req_id, None)
 
     async def api_request(self, url_path, body, captcha_action="VIDEO_GENERATION", method="POST", timeout=None, meta=None, client_id=None):
         """Send API request through a selected Chrome extension."""

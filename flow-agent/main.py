@@ -160,7 +160,7 @@ def _wait_for_generation_ready(timeout=None):
     """Wait for both the extension socket and captured Flow key."""
 
     health = _ensure_backend()
-    if health.get("extension_connected") is True and health.get("has_flow_key") is True:
+    if health.get("extension_connected") is True:
         return health
 
     if timeout is None:
@@ -169,7 +169,7 @@ def _wait_for_generation_ready(timeout=None):
     while time.monotonic() < deadline:
         time.sleep(0.5)
         health = _probe_backend(timeout=2) or {}
-        if health.get("extension_connected") is True and health.get("has_flow_key") is True:
+        if health.get("extension_connected") is True:
             return health
 
     extension = bool(health.get("extension_connected"))

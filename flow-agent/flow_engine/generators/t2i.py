@@ -85,18 +85,43 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
     aspect_ratio = IMAGE_ASPECTS.get(aspect, aspect)
     target_model = IMAGE_MODELS.get((model or "").lower(), DEFAULT_IMAGE_MODEL)
 
-    if os.environ.get("FLOW_FORCE_CANVAS_UI") == "1":
-        from ..canvas_driver import canvas_generate_image
-        log.warning("FLOW_FORCE_CANVAS_UI=1 set — routing image generation directly to Track 2 Canvas UI")
-        fb_data = await canvas_generate_image(
-            bridge, prompt=prompt, aspect=aspect, count=count, project_id=project_id
+    # Track 0: Official same-origin batchexecute RPC (ogiZ0b)
+    try:
+        from .. import batchexecute
+        freq = batchexecute.image_request(
+            prompt=prompt,
+            project_id=project_id,
+            count=count,
+            aspect=aspect,
+            seed=seed,
+            model=model or "GEM_PIX_2",
+            ref_media_ids=ref_media_ids,
         )
-        fb_results = _parse_image_results(fb_data)
-        for r in fb_results:
-            r["_model"] = target_model
-            r["_client_id"] = fb_data.get("_client_id", "")
-            r["_track"] = "canvas_ui_fallback"
-        return fb_results or None
+        rpc_res = await bridge.batch_rpc(
+            rpcid=batchexecute.RPC_GEN_IMAGE,
+            freq=freq,
+            captcha_action="IMAGE_GENERATION",
+            timeout=180.0,
+        )
+        if rpc_res.get("status") == 200:
+            raw_text = rpc_res.get("data", "")
+            payload = batchexecute.first_payload(raw_text, batchexecute.RPC_GEN_IMAGE)
+            gen_imgs = batchexecute.read_images(payload)
+            if gen_imgs:
+                results = [
+                    {
+                        "media_id": img.media_id,
+                        "image_url": img.url,
+                        "_model": target_model,
+                        "_client_id": rpc_res.get("_client_id", ""),
+                        "_track": "batchexecute_ogiz0b",
+                    }
+                    for img in gen_imgs
+                ]
+                log.info("batchexecute ogiZ0b generated %d image(s) successfully!", len(results))
+                return results
+    except Exception as exc:
+        log.warning("batchexecute ogiZ0b failed (%s); attempting legacy REST fallback...", exc)
 
     # Build N items in requests array (1 API call = N images)
     requests = []
@@ -157,25 +182,9 @@ async def generate_image(bridge, prompt: str, aspect: str, project_id: str,
             err = err.get("error", {}).get("message", result.get("error", "Unknown"))
         err_msg = f"{err}{reason}"
         upper_err = err_msg.upper()
-        if status != 200:
-            from ..canvas_driver import canvas_generate_image
-            log.warning(
-                "Track 1 REST T2I failed (%s: %s) — falling back to Track 2 Canvas UI!",
-                status, err_msg,
-            )
-            fb_data = await canvas_generate_image(
-                bridge, prompt=prompt, aspect=aspect, count=count, project_id=project_id,
-                client_id=client_id or None,
-            )
-            fb_results = _parse_image_results(fb_data)
-            for r in fb_results:
-                r["_model"] = target_model
-                r["_client_id"] = fb_data.get("_client_id", client_id)
-                r["_track"] = "canvas_ui_fallback"
-            if fb_results:
-                return fb_results
-        log.error("Failed (%s): %s", status, err_msg)
-        raise ValueError(err_msg)
+        log.error("Track 1 REST T2I failed (%s): %s", status, err_msg)
+        raise ValueError(f"Google Flow REST T2I/R2I failed ({status}): {err_msg}")
+
 
     data = result.get("data", {})
     client_id = result.get("_client_id")

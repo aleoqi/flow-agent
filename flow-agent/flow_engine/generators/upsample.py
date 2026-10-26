@@ -242,6 +242,32 @@ async def upsample_image(
     endpoint = ENDPOINTS.get("upsample_image", "/v1/flow/upsampleImage")
     log.info("Google Flow upsampling image %s -> %s [%s]", media_id[:12], res_key, enum_val)
 
+    # Track 0: Official same-origin batchexecute RPC (SPrCad)
+    try:
+        from .. import batchexecute
+        freq = batchexecute.image_upscale_request(media_id, resolution=res_key.upper())
+        rpc_res = await bridge.batch_rpc(
+            rpcid=batchexecute.RPC_UPSCALE_IMAGE,
+            freq=freq,
+            captcha_action="IMAGE_GENERATION",
+            timeout=120.0,
+        )
+        if rpc_res.get("status") == 200:
+            payload = batchexecute.first_payload(rpc_res.get("data", ""), batchexecute.RPC_UPSCALE_IMAGE)
+            encoded = batchexecute.read_upscaled_image(payload)
+            if encoded:
+                log.info("batchexecute SPrCad 2K/4K upscale succeeded for %s!", media_id[:12])
+                return {
+                    "media_id": media_id,
+                    "encoded_image": encoded,
+                    "resolution": res_key.upper(),
+                    "project_id": project_id,
+                    "data": {"encodedImage": encoded},
+                    "_track": "batchexecute_sprcad",
+                }
+    except Exception as exc:
+        log.warning("batchexecute SPrCad failed (%s); attempting REST fallback...", exc)
+
     # Collect project candidates: passed project_id first, then known fallback projects
     candidates = [project_id] if project_id else []
     for alt in ("0143adf4-5864-4cb4-abb5-fe4254ad0dc7", "576adec2-b74d-4cd9-93da-ad81378711db"):

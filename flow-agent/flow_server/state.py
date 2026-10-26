@@ -133,11 +133,10 @@ async def get_active_bridge() -> ExtensionBridge:
     if not bridge:
         raise HTTPException(status_code=503, detail="Extension bridge is not initialized")
 
-    is_healthy = await bridge.health_check()
-    if not is_healthy:
-        log.info("Bridge health check failed. Re-waiting for extension connection...")
-        connected = await bridge.wait_for_extension(timeout=10, max_retries=1)
-        if not connected:
+    if not bridge.is_extension_connected():
+        log.info("Extension not connected. Waiting...")
+        connected = await bridge.wait_for_extension(timeout=5, max_retries=1)
+        if not connected and not bridge.is_extension_connected():
             raise HTTPException(
                 status_code=503,
                 detail="Google Flow extension is not connected. Open Google Flow in Chrome."

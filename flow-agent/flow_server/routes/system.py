@@ -152,7 +152,9 @@ async def refresh_tokens(x_client_id: Optional[str] = Header(None, alias="X-Clie
     """Ask token-less clients to open/refresh their Flow tab so a token gets
     captured. With X-Client-Id only that client is nudged; without it, every
     connected client that currently has no token is nudged."""
-    active_bridge = await get_active_bridge()
+    active_bridge = state.get_bridge()
+    if not active_bridge:
+        raise HTTPException(status_code=503, detail="Extension bridge is not initialized")
 
     if x_client_id:
         targets = [x_client_id]
@@ -257,6 +259,20 @@ async def reload_extension():
         await bridge.send_message_to(cid, msg)
     return {"reloading": len(clients), "clients": clients}
 
+
+
+@router.post("/v1/system/batch-rpc")
+async def batch_rpc_endpoint(body: dict = Body(...), x_client_id: Optional[str] = Header(None, alias="X-Client-Id")):
+    bridge = state.get_bridge()
+    if not bridge:
+        raise HTTPException(status_code=503, detail="Bridge not running")
+    rpcid = body.get("rpcid")
+    freq = body.get("freq")
+    captcha_action = body.get("captcha_action")
+    timeout = float(body.get("timeout", 60.0))
+    client_id = x_client_id or body.get("client_id")
+    res = await bridge.batch_rpc(rpcid=rpcid, freq=freq, captcha_action=captcha_action, timeout=timeout, client_id=client_id)
+    return res
 
 @router.post("/v1/system/eval-tab")
 async def eval_tab(body: dict = Body(...), x_client_id: Optional[str] = Header(None, alias="X-Client-Id")):
